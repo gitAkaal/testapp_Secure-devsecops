@@ -1,0 +1,75 @@
+name: Build and Security Scan
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-and-scan:
+    runs-on: ubuntu-latest
+    
+    services:
+      test-app:
+        image: node:16
+        ports:
+          - 3000:3000
+    
+    steps:
+    - uses: actions/checkout@v3
+    
+    # Build and start test application
+    - name: Setup Node.js
+      uses: actions/setup-node@v3
+      with:
+        node-version: '16'
+        
+    - name: Install dependencies
+      working-directory: ./test-app
+      run: |
+        npm install
+        
+    - name: Start application
+      working-directory: ./test-app
+      run: |
+        node app.js &
+        echo "Waiting for application to start..."
+        sleep 15
+        
+    - name: Check if application is running
+      run: |
+        curl http://localhost:3000
+        
+    # OWASP ZAP Scan
+    - name: ZAP Baseline Scan
+      uses: zaproxy/action-baseline@v0.9.0
+      with:
+        target: 'http://localhost:3000'
+        fail_action: false
+        
+    # More detailed full scan
+    - name: ZAP Full Scan
+      uses: zaproxy/action-full-scan@v0.7.0
+      with:
+        target: 'http://localhost:3000'
+        fail_action: false
+        
+    - name: Upload ZAP Scan Report
+      uses: actions/upload-artifact@v3
+      with:
+        name: zap-scan-reports
+        path: |
+          zap-*-report.html
+          zap-*-report.md
+        
+    - name: Summarize vulnerabilities
+      run: |
+        echo "### ZAP Scan Summary" >> $GITHUB_STEP_SUMMARY
+        echo "Checking scan results..." >> $GITHUB_STEP_SUMMARY
+        if grep -q "High Risk Alerts: [^0]" zap-*-report.md; then
+          echo "⚠️ High risk vulnerabilities found!" >> $GITHUB_STEP_SUMMARY
+        else
+          echo "✅ No high risk vulnerabilities found" >> $GITHUB_STEP_SUMMARY
+        fi
