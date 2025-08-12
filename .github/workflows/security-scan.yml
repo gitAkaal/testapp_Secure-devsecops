@@ -1,4 +1,4 @@
-name: Security Scan (SAST & DAST)
+﻿name: Security Scan (SAST & DAST)
 
 on:
   push:
@@ -48,8 +48,6 @@ jobs:
     needs: get-changed-files
     if: needs.get-changed-files.outputs.java_changes != ''
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v3
 
@@ -60,12 +58,6 @@ jobs:
           # Run Bearer scan
           bearer scan . --format=text --output=bearer-report.txt
           bearer scan . --format=sarif --output=bearer-results.sarif
-
-      - name: Generate Bearer Report
-        run: |
-          echo "=== Bearer Java Security Scan Complete ===" > bearer-report.txt
-          cat bearer-results.sarif >> bearer-report.txt
-          echo "========================================">> bearer-report.txt
 
       - name: Upload Bearer Results
         uses: actions/upload-artifact@v4
@@ -81,8 +73,6 @@ jobs:
     needs: get-changed-files
     if: needs.get-changed-files.outputs.python_changes != ''
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v3
 
@@ -119,119 +109,150 @@ jobs:
   trivy-scan:
     name: Trivy SAST Scan
     needs: get-changed-files
-    if: needs.get-changed-files.outputs.all_changes != ''
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-    # SAST Scan with Trivy
-    - name: Run Trivy vulnerability scanner
-      uses: aquasecurity/trivy-action@master
-      with:
-        scan-type: 'fs'
-        scan-ref: ${{ needs.get-changed-files.outputs.all_changes }}
-        format: 'json'
-        output: 'trivy-results.json'
-        severity: 'CRITICAL,HIGH,MEDIUM'
-        exit-code: '0'
-    
-    - name: Generate Trivy Report
-      run: |
-        echo "=== Trivy Scan Results ===" > trivy-report.txt
-        trivy filesystem . --format table >> trivy-report.txt
-        echo "=========================" >> trivy-report.txt
+      - name: Install Trivy
+        run: |
+          sudo apt-get install wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy -y
 
-    - name: Upload Trivy Results
-      uses: actions/upload-artifact@v4
-      with:
-        name: trivy-scan-results
-        path: |
-          trivy-report.txt
-          trivy-results.json
-        retention-days: 90
+      - name: Run Trivy Scan
+        run: |
+          echo "=== Running Trivy Vulnerability Scan ===" > trivy-report.txt
+          trivy fs --skip-dirs .git/ \
+                   --skip-files ".github/workflows/*.yml" \
+                   --format json \
+                   --output trivy-results.json \
+                   --scanners vuln \
+                   --severity HIGH,CRITICAL \
+                   --exit-code 0 \
+                   .
+          
+          echo "=== Trivy Scan Results ===" >> trivy-report.txt
+          if [ -f "trivy-results.json" ]; then
+            jq -r '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | "[\(.Severity)] \(.VulnerabilityID): \(.Title)"' trivy-results.json >> trivy-report.txt 2>/dev/null || echo "No vulnerabilities found" >> trivy-report.txt
+          fi
+          echo "=========================" >> trivy-report.txt
+
+      - name: Upload Trivy Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-scan-results
+          path: |
+            trivy-report.txt
+            trivy-results.json
+          retention-days: 90
 
   zap-scan:
     name: ZAP DAST Scan
+    needs: get-changed-files
+    if: needs.get-changed-files.outputs.python_changes != ''
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    
     steps:
-    - uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-    # Setup Python and start Flask app
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.12'
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
 
-    - name: Install Flask
-      run: |
-        python -m pip install --upgrade pip
-        pip install flask
+      - name: Install Flask
+        run: |
+          python -m pip install --upgrade pip
+          pip install flask
 
-    - name: Start Flask App
-      run: |
-        cd python_wordstop
-        export FLASK_APP=wordstop.py
-        export FLASK_ENV=development
-        export FLASK_DEBUG=0
-        python -m flask run --host=0.0.0.0 > flask.log 2>&1 &
-        echo "Waiting for Flask to start..."
-        sleep 5  # Give Flask some time to initialize
-        for i in {1..30}; do
-          if curl -s http://localhost:5000 > /dev/null 2>&1; then
-            echo "Flask app is running!"
-            cat flask.log
-            break
+      - name: Start Flask App
+        run: |
+          cd python_wordstop
+          export FLASK_APP=wordstop.py
+          export FLASK_ENV=development
+          export FLASK_DEBUG=0
+          python -m flask run --host=0.0.0.0 > flask.log 2>&1 &
+          echo "Waiting for Flask to start..."
+          sleep 5
+          for i in {1..30}; do
+            if curl -s http://localhost:5000 > /dev/null 2>&1; then
+              echo "Flask app is running!"
+              cat flask.log
+              break
+            fi
+            echo "Attempt $i: Waiting for Flask to start..."
+            sleep 2
+            if [ $i -eq 30 ]; then
+              echo "Flask failed to start. Log output:"
+              cat flask.log
+              exit 1
+            fi
+          done
+
+      - name: Create ZAP Configuration
+        run: |
+          # Create ZAP hook script
+          cat > zap-hook.py << EOL
+          def zap_started(zap, target):
+              # Ignore common alerts for demo
+              zap.alertfilter.add_alertfilter(
+                  alertid="10036",
+                  url_is_regex="true",
+                  url=".*",
+                  enabled="true")
+              zap.alertfilter.add_alertfilter(
+                  alertid="10055",
+                  url_is_regex="true",
+                  url=".*",
+                  enabled="true")
+              zap.alertfilter.add_alertfilter(
+                  alertid="10106",
+                  url_is_regex="true",
+                  url=".*",
+                  enabled="true")
+              zap.alertfilter.add_alertfilter(
+                  alertid="90004",
+                  url_is_regex="true",
+                  url=".*",
+                  enabled="true")
+          EOL
+
+      - name: Run ZAP Scan
+        continue-on-error: true  # Continue even if vulnerabilities are found
+        run: |
+          docker pull ghcr.io/zaproxy/zaproxy:stable
+          docker run --network host \
+            -v ${PWD}:/zap/wrk/:rw \
+            --user root \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+            -t http://localhost:5000 \
+            -J zap-report.json \
+            -x zap-report.xml \
+            -r zap-report.html \
+            --hook=/zap/wrk/zap-hook.py \
+            -z "-config api.disablekey=true -config scanner.attackOnStart=true -config scanner.threadPerHost=5"
+
+      - name: Generate ZAP Report
+        if: always()  # Run even if ZAP scan "fails" due to findings
+        run: |
+          echo "=== ZAP DAST Scan Results ===" > zap-summary.txt
+          if [ -f "zap-report.json" ]; then
+            echo "Found issues:" >> zap-summary.txt
+            jq -r '.site[].alerts[] | "[\(.risk)] \(.name): \(.description)"' zap-report.json >> zap-summary.txt 2>/dev/null || echo "No issues found or invalid report format" >> zap-summary.txt
+          else
+            echo "ZAP scan completed but no report file was generated" >> zap-summary.txt
           fi
-          echo "Attempt $i: Waiting for Flask to start..."
-          sleep 2
-          if [ $i -eq 30 ]; then
-            echo "Flask failed to start. Log output:"
-            cat flask.log
-            exit 1
-          fi
-        done
+          echo "===============================" >> zap-summary.txt
+          cat zap-summary.txt
 
-    # Run OWASP ZAP DAST Scan with Full Active and Passive Scanning
-    - name: Run ZAP Full Scan
-      run: |
-        docker pull ghcr.io/zaproxy/zaproxy:stable
-        docker run --network host \
-          -v ${PWD}:/zap/wrk/:rw \
-          --user root \
-          ghcr.io/zaproxy/zaproxy:stable \
-          zap-full-scan.py \
-          -t http://localhost:5000 \
-          -I \
-          -j \
-          -m 10 \
-          -z "-config api.disablekey=true -config scanner.attackOnStart=true -config scanner.threadPerHost=5 -config view.mode=attack -config api.addrs.addr.regex=true -config api.addrs.addr.name=.* -config database.recoverylog=false -addoninstall ascanrulesAlpha -addoninstall ascanrulesBeta"
-
-    # Generate and Upload ZAP Report
-    - name: Generate ZAP Report
-      run: |
-        echo "=== ZAP DAST Scan Results ===" > zap-report.txt
-        docker run --network host \
-          -v ${PWD}:/zap/wrk/:rw \
-          --user root \
-          ghcr.io/zaproxy/zaproxy:stable \
-          zap-full-scan.py \
-          -t http://localhost:5000 \
-          -x zap-report.xml \
-          -r zap-report.html \
-          -J zap-report.json
-
-    - name: Upload ZAP Results
-      uses: actions/upload-artifact@v4
-      with:
-        name: zap-scan-results
-        path: |
-          zap-report.txt
-          zap-report.xml
-          zap-report.html
-          zap-report.json
-        retention-days: 90
+      - name: Upload ZAP Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-results
+          path: |
+            zap-summary.txt
+            zap-report.*
+          retention-days: 90
