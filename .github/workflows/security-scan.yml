@@ -24,21 +24,24 @@ jobs:
         id: filter
         run: |
           if [ "${{ github.event_name }}" == "pull_request" ]; then
-            # For pull requests, compare with the base branch
-            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }})
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }} | tr '\n' ' ')
           else
-            # For pushes, compare with the previous commit
-            CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+            CHANGED_FILES=$(git diff --name-only HEAD^ HEAD | tr '\n' ' ')
           fi
           
           # Filter files by type
-          PYTHON_FILES=$(echo "$CHANGED_FILES" | grep -E '\.py$' || true)
-          JAVA_FILES=$(echo "$CHANGED_FILES" | grep -E '\.java$' || true)
+          PYTHON_FILES=$(echo "$CHANGED_FILES" | tr ' ' '\n' | grep -E '\.py$' | tr '\n' ' ' || echo '')
+          JAVA_FILES=$(echo "$CHANGED_FILES" | tr ' ' '\n' | grep -E '\.java$' | tr '\n' ' ' || echo '')
           
-          # Set outputs
-          echo "python_files=${PYTHON_FILES}" >> $GITHUB_OUTPUT
-          echo "java_files=${JAVA_FILES}" >> $GITHUB_OUTPUT
-          echo "all_files=${CHANGED_FILES}" >> $GITHUB_OUTPUT
+          # Set outputs with proper formatting
+          echo "python_files=$PYTHON_FILES" >> $GITHUB_OUTPUT
+          echo "java_files=$JAVA_FILES" >> $GITHUB_OUTPUT
+          echo "all_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          
+          # Debug output
+          echo "Changed files: $CHANGED_FILES"
+          echo "Python files: $PYTHON_FILES"
+          echo "Java files: $JAVA_FILES"
 
   bearer-scan:
     name: Bearer Java SAST Scan
@@ -50,21 +53,13 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Run Bearer Scanner
-        uses: bearer/bearer-action@v2
-        with:
-          config: |
-            {
-              "technology": ["java"],
-              "severity": ["CRITICAL", "HIGH", "MEDIUM"],
-              "detail": true,
-              "format": "sarif",
-              "scanners": ["sast", "secrets", "dependency"]
-            }
-          report-url: false
-          input-dir: ${{ needs.get-changed-files.outputs.java_changes }}
-          fail-on-findings: false
-          output: 'bearer-results.sarif'
+      - name: Install and Run Bearer Scanner
+        run: |
+          # Install Bearer
+          curl -sfL https://raw.githubusercontent.com/Bearer/bearer/main/contrib/install.sh | sh
+          # Run Bearer scan
+          bearer scan . --format=text --output=bearer-report.txt
+          bearer scan . --format=sarif --output=bearer-results.sarif
 
       - name: Generate Bearer Report
         run: |
@@ -73,7 +68,7 @@ jobs:
           echo "========================================">> bearer-report.txt
 
       - name: Upload Bearer Results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: bearer-scan-results
           path: |
@@ -113,7 +108,7 @@ jobs:
           echo "========================================" | tee -a bandit-report.txt
 
       - name: Upload Bandit Results
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: bandit-scan-results
           path: |
@@ -149,7 +144,7 @@ jobs:
         echo "=========================" >> trivy-report.txt
 
     - name: Upload Trivy Results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: trivy-scan-results
         path: |
@@ -231,7 +226,7 @@ jobs:
           -J zap-report.json
 
     - name: Upload ZAP Results
-      uses: actions/upload-artifact@v3
+      uses: actions/upload-artifact@v4
       with:
         name: zap-scan-results
         path: |
