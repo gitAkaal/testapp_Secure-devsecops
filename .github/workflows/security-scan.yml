@@ -8,8 +8,42 @@ on:
   workflow_dispatch:
 
 jobs:
+  get-changed-files:
+    name: Get Changed Files
+    runs-on: ubuntu-latest
+    outputs:
+      python_changes: ${{ steps.filter.outputs.python_files }}
+      java_changes: ${{ steps.filter.outputs.java_files }}
+      all_changes: ${{ steps.filter.outputs.all_files }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            # For pull requests, compare with the base branch
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }})
+          else
+            # For pushes, compare with the previous commit
+            CHANGED_FILES=$(git diff --name-only HEAD^ HEAD)
+          fi
+          
+          # Filter files by type
+          PYTHON_FILES=$(echo "$CHANGED_FILES" | grep -E '\.py$' || true)
+          JAVA_FILES=$(echo "$CHANGED_FILES" | grep -E '\.java$' || true)
+          
+          # Set outputs
+          echo "python_files=${PYTHON_FILES}" >> $GITHUB_OUTPUT
+          echo "java_files=${JAVA_FILES}" >> $GITHUB_OUTPUT
+          echo "all_files=${CHANGED_FILES}" >> $GITHUB_OUTPUT
+
   bearer-scan:
     name: Bearer Java SAST Scan
+    needs: get-changed-files
+    if: needs.get-changed-files.outputs.java_changes != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -28,7 +62,7 @@ jobs:
               "scanners": ["sast", "secrets", "dependency"]
             }
           report-url: false
-          input-dir: 'java_wordstop'
+          input-dir: ${{ needs.get-changed-files.outputs.java_changes }}
           fail-on-findings: false
 
       - name: Print Bearer Summary
@@ -39,6 +73,8 @@ jobs:
 
   bandit-scan:
     name: Bandit SAST Scan
+    needs: get-changed-files
+    if: needs.get-changed-files.outputs.python_changes != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -58,11 +94,15 @@ jobs:
       - name: Run Bandit SAST scan
         run: |
           echo "=== Python Security Scan with Bandit ==="
-          bandit -r python_wordstop/ -f txt --exit-zero || true
-          echo "========================================"
-
-  trivy-scan:
+          echo "Scanning changed files: ${{ needs.get-changed-files.outputs.python_changes }}"
+          for file in ${{ needs.get-changed-files.outputs.python_changes }}; do
+            echo "Scanning $file..."
+            bandit -r "$file" -f txt --exit-zero || true
+          done
+          echo "========================================"   trivy-scan:
     name: Trivy SAST Scan
+    needs: get-changed-files
+    if: needs.get-changed-files.outputs.all_changes != ''
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -74,7 +114,7 @@ jobs:
       uses: aquasecurity/trivy-action@master
       with:
         scan-type: 'fs'
-        scan-ref: '.'
+        scan-ref: ${{ needs.get-changed-files.outputs.all_changes }}
         format: 'table'
         output: '/dev/stdout'
         severity: 'CRITICAL,HIGH,MEDIUM'
