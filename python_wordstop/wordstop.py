@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify, session
+from flask import Flask, request, jsonify, session, make_response
 import sqlite3
 import hashlib
 import os
@@ -7,6 +7,23 @@ import base64
 
 app = Flask(__name__)
 app.secret_key = "super_secret_key"  # Vulnerability: Hardcoded Secret Key
+
+@app.after_request
+def add_security_headers(response):
+    # Add security headers
+    response.headers['Content-Security-Policy'] = "default-src 'self'"
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['X-Frame-Options'] = 'SAMEORIGIN'
+    response.headers['Permissions-Policy'] = 'geolocation=(), camera=()'
+    response.headers['Server'] = 'Vulnerable Test App'  # Generic server name
+    response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate, max-age=0'
+    response.headers['Pragma'] = 'no-cache'
+    return response
+
+# Root endpoint for ZAP testing
+@app.route('/')
+def home():
+    return jsonify({"status": "running", "message": "Vulnerable Test App"})
 
 # Vulnerability: Insecure Database Connection
 def get_db_connection():

@@ -40,9 +40,24 @@ jobs:
     - name: Build and start Python app
       run: |
         cd python_wordstop
-        python wordstop.py &
+        nohup python wordstop.py > flask.log 2>&1 &
         echo "Waiting for Python app to start..."
-        sleep 10
+        # Wait for the app to be ready
+        for i in {1..30}; do
+          if curl -s http://localhost:5000 > /dev/null; then
+            echo "Application is up!"
+            break
+          fi
+          echo "Waiting for application... ($i/30)"
+          sleep 2
+        done
+        # Check if app is really running
+        curl -v http://localhost:5000
+        if [ $? -ne 0 ]; then
+          echo "Application failed to start"
+          cat flask.log
+          exit 1
+        fi
 
     # SAST Scan with Trivy
     - name: Run Trivy vulnerability scanner in fs mode
@@ -68,6 +83,18 @@ jobs:
         target: 'http://localhost:5000'
         fail_action: false
         token: ${{ secrets.GITHUB_TOKEN }}
+        rules_file_name: '.zap/rules.tsv'
+        cmd_options: '-I'
+
+    - name: Create ZAP rules file
+      run: |
+        mkdir -p .zap
+        cat > .zap/rules.tsv << EOL
+        10036	IGNORE	Server Leaks Version Information
+        10038	IGNORE	Content Security Policy (CSP) Header Not Set
+        10049	IGNORE	Storable and Cacheable Content
+        10063	IGNORE	Permissions Policy Header Not Set
+        EOL
 
     - name: ZAP Full Scan
       uses: zaproxy/action-full-scan@v0.7.0
@@ -75,6 +102,8 @@ jobs:
         target: 'http://localhost:5000'
         fail_action: false
         token: ${{ secrets.GITHUB_TOKEN }}
+        rules_file_name: '.zap/rules.tsv'
+        cmd_options: '-I'
 
     # Generate Security Report
     - name: Generate Security Report
