@@ -62,28 +62,42 @@ jobs:
     permissions:
       contents: read
     
-    services:
-      flask-app:
-        image: python:3.12
-        ports:
-          - 5000:5000
-    
     steps:
     - uses: actions/checkout@v3
 
-    # Start Flask app in container
-    - name: Setup and Start Flask App
+    # Setup Python and start Flask app
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.12'
+
+    - name: Install Flask
       run: |
-        docker exec $(docker ps -q --filter ancestor=python:3.12) /bin/bash -c "
-          cd /github/workspace/python_wordstop &&
-          pip install flask &&
-          FLASK_APP=wordstop.py FLASK_ENV=development python -m flask run --host=0.0.0.0"
+        python -m pip install --upgrade pip
+        pip install flask
+
+    - name: Start Flask App
+      run: |
+        cd python_wordstop
+        nohup python -m flask run --host=0.0.0.0 &
+        echo "Waiting for Flask to start..."
+        timeout=30
+        while ! curl -s http://localhost:5000 > /dev/null && [ $timeout -gt 0 ]; do
+          sleep 1
+          timeout=$((timeout-1))
+          echo "Waiting... ($timeout seconds left)"
+        done
+        if ! curl -s http://localhost:5000 > /dev/null; then
+          echo "Flask app failed to start"
+          exit 1
+        fi
+        echo "Flask app is running"
 
     # Run OWASP ZAP DAST Scan with Full Active and Passive Scanning
     - name: Run ZAP Full Scan
       run: |
         docker pull ghcr.io/zaproxy/zaproxy:stable
-        docker run --network container:$(docker ps -q --filter ancestor=python:3.12) \
+        docker run --network host \
           -v ${PWD}:/zap/wrk/:rw \
           --user root \
           ghcr.io/zaproxy/zaproxy:stable \
