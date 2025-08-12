@@ -10,6 +10,10 @@ on:
 jobs:
   security-scanning:
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write    # Required for uploading SARIF results
+      actions: read            # Required for reading workflow info
+      contents: read          # Required for checking out code
     
     steps:
     - uses: actions/checkout@v3
@@ -52,9 +56,10 @@ jobs:
 
     # Upload Trivy scan results to GitHub Security tab
     - name: Upload Trivy scan results
-      uses: github/codeql-action/upload-sarif@v2
+      uses: github/codeql-action/upload-sarif@v3
       with:
         sarif_file: 'trivy-results.sarif'
+        category: trivy-results
 
     # Run OWASP ZAP DAST Scan
     - name: ZAP Baseline Scan
