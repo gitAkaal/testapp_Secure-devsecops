@@ -8,6 +8,22 @@ on:
   workflow_dispatch:
 
 jobs:
+  ethical-check:
+    name: EthicalCheck API Scan
+    runs-on: ubuntu-latest
+    needs: [zap-scan]  # This ensures the API is running before EthicalCheck starts
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: APIsec Ethical Check
+        uses: apisec-inc/apisec-run-scan@v1.0.0
+        with:
+          apisec-username: ${{ secrets.APISEC_USERNAME }}
+          apisec-password: ${{ secrets.APISEC_PASSWORD }}
+          apisec-url: "http://localhost:5000"
+          apisec-profile: "ethical-check"
+
   bandit-scan:
     name: Bandit SAST Scan
     runs-on: ubuntu-latest
@@ -32,28 +48,44 @@ jobs:
           bandit -r python_wordstop/ -f txt --exit-zero || true
           echo "========================================"
 
-  trivy-zap-scan:
-    name: Trivy & ZAP Scan
+  trivy-scan:
+    name: Trivy SAST Scan
     runs-on: ubuntu-latest
     permissions:
-      security-events: write    # Required for uploading SARIF results
-      actions: read            # Required for reading workflow info
-      contents: read          # Required for checking out code
+      contents: read
+    steps:
+    - uses: actions/checkout@v3
+
+    # SAST Scan with Trivy
+    - name: Run Trivy vulnerability scanner
+      uses: aquasecurity/trivy-action@master
+      with:
+        scan-type: 'fs'
+        scan-ref: '.'
+        format: 'table'
+        output: '/dev/stdout'
+        severity: 'CRITICAL,HIGH,MEDIUM'
+        exit-code: '0'
+    
+    # Print Trivy Summary
+    - name: Print Trivy Scan Summary
+      run: |
+        echo "Trivy scan completed. Check the logs above for results."
+
+  zap-scan:
+    name: ZAP DAST Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
     
     steps:
     - uses: actions/checkout@v3
 
-    # Setup Python and Java
-    - name: Set up Python for Flask app
+    # Setup Python for Flask app
+    - name: Set up Python
       uses: actions/setup-python@v4
       with:
         python-version: '3.12'
-        
-    - name: Set up Java for testing
-      uses: actions/setup-java@v3
-      with:
-        distribution: 'temurin'
-        java-version: '17'
 
     # Install Dependencies
     - name: Install Python dependencies
@@ -84,17 +116,6 @@ jobs:
           exit 1
         fi
 
-    # SAST Scan with Trivy
-    - name: Run Trivy vulnerability scanner in fs mode
-      uses: aquasecurity/trivy-action@master
-      with:
-        scan-type: 'fs'
-        scan-ref: '.'
-        format: 'table'
-        output: '/dev/stdout'
-        severity: 'CRITICAL,HIGH,MEDIUM'
-        exit-code: '0'
-
     # Run OWASP ZAP DAST Scan with Full Active and Passive Scanning
     - name: Run ZAP Full Scan
       run: |
@@ -110,7 +131,7 @@ jobs:
           -m 10 \
           -z "-config api.disablekey=true -config scanner.attackOnStart=true -config scanner.threadPerHost=5 -config view.mode=attack -config api.addrs.addr.regex=true -config api.addrs.addr.name=.* -config database.recoverylog=false -addoninstall ascanrulesAlpha -addoninstall ascanrulesBeta"
 
-    # Print Summary
-    - name: Print Security Scan Summary
+    # Print ZAP Summary
+    - name: Print ZAP Scan Summary
       run: |
-        echo "Security scan completed. Check the logs above for Trivy and ZAP scan results."
+        echo "ZAP DAST scan completed. Check the logs above for results."
