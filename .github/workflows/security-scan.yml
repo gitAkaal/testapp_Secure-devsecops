@@ -8,7 +8,32 @@ on:
   workflow_dispatch:
 
 jobs:
-  security-scanning:
+  bandit-scan:
+    name: Bandit SAST Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Install Bandit
+        run: |
+          python -m pip install --upgrade pip
+          pip install bandit
+
+      - name: Run Bandit SAST scan
+        run: |
+          echo "=== Python Security Scan with Bandit ==="
+          bandit -r python_wordstop/ -f txt --exit-zero || true
+          echo "========================================"
+
+  trivy-zap-scan:
+    name: Trivy & ZAP Scan
     runs-on: ubuntu-latest
     permissions:
       security-events: write    # Required for uploading SARIF results
@@ -19,12 +44,12 @@ jobs:
     - uses: actions/checkout@v3
 
     # Setup Python and Java
-    - name: Set up Python
+    - name: Set up Python for Flask app
       uses: actions/setup-python@v4
       with:
         python-version: '3.12'
         
-    - name: Set up Java
+    - name: Set up Java for testing
       uses: actions/setup-java@v3
       with:
         distribution: 'temurin'
