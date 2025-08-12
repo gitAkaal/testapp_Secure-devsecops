@@ -99,7 +99,9 @@ jobs:
             echo "Scanning $file..."
             bandit -r "$file" -f txt --exit-zero || true
           done
-          echo "========================================"   trivy-scan:
+          echo "========================================"
+
+  trivy-scan:
     name: Trivy SAST Scan
     needs: get-changed-files
     if: needs.get-changed-files.outputs.all_changes != ''
