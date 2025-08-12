@@ -95,15 +95,20 @@ jobs:
         severity: 'CRITICAL,HIGH,MEDIUM'
         exit-code: '0'
 
-    # Run OWASP ZAP DAST Scan
-    - name: Run ZAP Scan
+    # Run OWASP ZAP DAST Scan with Full Active and Passive Scanning
+    - name: Run ZAP Full Scan
       run: |
         docker pull ghcr.io/zaproxy/zaproxy:stable
         docker run --network=host \
           -v ${PWD}:/zap/wrk/:rw \
           --user root \
           ghcr.io/zaproxy/zaproxy:stable \
-          zap-baseline.py -t http://localhost:5000 -I
+          zap-full-scan.py \
+          -t http://localhost:5000 \
+          -I \
+          -j \
+          -m 10 \
+          -z "-config api.disablekey=true -config scanner.attackOnStart=true -config scanner.threadPerHost=5 -config view.mode=attack -config api.addrs.addr.regex=true -config api.addrs.addr.name=.* -config database.recoverylog=false -addoninstall ascanrulesAlpha -addoninstall ascanrulesBeta"
 
     # Print Summary
     - name: Print Security Scan Summary
