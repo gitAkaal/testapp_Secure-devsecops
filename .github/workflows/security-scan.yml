@@ -58,18 +58,28 @@ jobs:
               "technology": ["java"],
               "severity": ["CRITICAL", "HIGH", "MEDIUM"],
               "detail": true,
-              "format": "text",
+              "format": "sarif",
               "scanners": ["sast", "secrets", "dependency"]
             }
           report-url: false
           input-dir: ${{ needs.get-changed-files.outputs.java_changes }}
           fail-on-findings: false
+          output: 'bearer-results.sarif'
 
-      - name: Print Bearer Summary
+      - name: Generate Bearer Report
         run: |
-          echo "=== Bearer Java Security Scan Complete ==="
-          echo "Check the logs above for detailed results."
-          echo "========================================"
+          echo "=== Bearer Java Security Scan Complete ===" > bearer-report.txt
+          cat bearer-results.sarif >> bearer-report.txt
+          echo "========================================">> bearer-report.txt
+
+      - name: Upload Bearer Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: bearer-scan-results
+          path: |
+            bearer-report.txt
+            bearer-results.sarif
+          retention-days: 90
 
   bandit-scan:
     name: Bandit SAST Scan
@@ -93,13 +103,23 @@ jobs:
 
       - name: Run Bandit SAST scan
         run: |
-          echo "=== Python Security Scan with Bandit ==="
-          echo "Scanning changed files: ${{ needs.get-changed-files.outputs.python_changes }}"
+          echo "=== Python Security Scan with Bandit ===" | tee bandit-report.txt
+          echo "Scanning changed files: ${{ needs.get-changed-files.outputs.python_changes }}" | tee -a bandit-report.txt
           for file in ${{ needs.get-changed-files.outputs.python_changes }}; do
-            echo "Scanning $file..."
-            bandit -r "$file" -f txt --exit-zero || true
+            echo "Scanning $file..." | tee -a bandit-report.txt
+            bandit -r "$file" -f json -o "bandit-$file.json" --exit-zero || true
+            bandit -r "$file" -f txt --exit-zero | tee -a bandit-report.txt || true
           done
-          echo "========================================"
+          echo "========================================" | tee -a bandit-report.txt
+
+      - name: Upload Bandit Results
+        uses: actions/upload-artifact@v3
+        with:
+          name: bandit-scan-results
+          path: |
+            bandit-report.txt
+            bandit-*.json
+          retention-days: 90
 
   trivy-scan:
     name: Trivy SAST Scan
@@ -117,15 +137,25 @@ jobs:
       with:
         scan-type: 'fs'
         scan-ref: ${{ needs.get-changed-files.outputs.all_changes }}
-        format: 'table'
-        output: '/dev/stdout'
+        format: 'json'
+        output: 'trivy-results.json'
         severity: 'CRITICAL,HIGH,MEDIUM'
         exit-code: '0'
     
-    # Print Trivy Summary
-    - name: Print Trivy Scan Summary
+    - name: Generate Trivy Report
       run: |
-        echo "Trivy scan completed. Check the logs above for results."
+        echo "=== Trivy Scan Results ===" > trivy-report.txt
+        trivy filesystem . --format table >> trivy-report.txt
+        echo "=========================" >> trivy-report.txt
+
+    - name: Upload Trivy Results
+      uses: actions/upload-artifact@v3
+      with:
+        name: trivy-scan-results
+        path: |
+          trivy-report.txt
+          trivy-results.json
+        retention-days: 90
 
   zap-scan:
     name: ZAP DAST Scan
@@ -186,7 +216,27 @@ jobs:
           -m 10 \
           -z "-config api.disablekey=true -config scanner.attackOnStart=true -config scanner.threadPerHost=5 -config view.mode=attack -config api.addrs.addr.regex=true -config api.addrs.addr.name=.* -config database.recoverylog=false -addoninstall ascanrulesAlpha -addoninstall ascanrulesBeta"
 
-    # Print ZAP Summary
-    - name: Print ZAP Scan Summary
+    # Generate and Upload ZAP Report
+    - name: Generate ZAP Report
       run: |
-        echo "ZAP DAST scan completed. Check the logs above for results."
+        echo "=== ZAP DAST Scan Results ===" > zap-report.txt
+        docker run --network host \
+          -v ${PWD}:/zap/wrk/:rw \
+          --user root \
+          ghcr.io/zaproxy/zaproxy:stable \
+          zap-full-scan.py \
+          -t http://localhost:5000 \
+          -x zap-report.xml \
+          -r zap-report.html \
+          -J zap-report.json
+
+    - name: Upload ZAP Results
+      uses: actions/upload-artifact@v3
+      with:
+        name: zap-scan-results
+        path: |
+          zap-report.txt
+          zap-report.xml
+          zap-report.html
+          zap-report.json
+        retention-days: 90
