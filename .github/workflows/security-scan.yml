@@ -8,6 +8,35 @@ on:
   workflow_dispatch:
 
 jobs:
+  bearer-scan:
+    name: Bearer Java SAST Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run Bearer Scanner
+        uses: bearer/bearer-action@v2
+        with:
+          config: |
+            {
+              "technology": ["java"],
+              "severity": ["CRITICAL", "HIGH", "MEDIUM"],
+              "detail": true,
+              "format": "text",
+              "scanners": ["sast", "secrets", "dependency"]
+            }
+          report-url: false
+          input-dir: 'java_wordstop'
+          fail-on-findings: false
+
+      - name: Print Bearer Summary
+        run: |
+          echo "=== Bearer Java Security Scan Complete ==="
+          echo "Check the logs above for detailed results."
+          echo "========================================"
+
   bandit-scan:
     name: Bandit SAST Scan
     runs-on: ubuntu-latest
@@ -79,19 +108,26 @@ jobs:
     - name: Start Flask App
       run: |
         cd python_wordstop
-        nohup python -m flask run --host=0.0.0.0 &
+        export FLASK_APP=wordstop.py
+        export FLASK_ENV=development
+        export FLASK_DEBUG=0
+        python -m flask run --host=0.0.0.0 > flask.log 2>&1 &
         echo "Waiting for Flask to start..."
-        timeout=30
-        while ! curl -s http://localhost:5000 > /dev/null && [ $timeout -gt 0 ]; do
-          sleep 1
-          timeout=$((timeout-1))
-          echo "Waiting... ($timeout seconds left)"
+        sleep 5  # Give Flask some time to initialize
+        for i in {1..30}; do
+          if curl -s http://localhost:5000 > /dev/null 2>&1; then
+            echo "Flask app is running!"
+            cat flask.log
+            break
+          fi
+          echo "Attempt $i: Waiting for Flask to start..."
+          sleep 2
+          if [ $i -eq 30 ]; then
+            echo "Flask failed to start. Log output:"
+            cat flask.log
+            exit 1
+          fi
         done
-        if ! curl -s http://localhost:5000 > /dev/null; then
-          echo "Flask app failed to start"
-          exit 1
-        fi
-        echo "Flask app is running"
 
     # Run OWASP ZAP DAST Scan with Full Active and Passive Scanning
     - name: Run ZAP Full Scan
