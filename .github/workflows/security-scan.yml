@@ -1,15 +1,53 @@
-﻿name: Security Scan (SAST & DAST)
+name: Security Scan (SAST & DAST)
 
 on:
   push:
     branches: [ main ]
+    paths:
+      - '**.py'
+      - '**.java'
+      - 'Dockerfile'
+      - '**/requirements.txt'
+      - 'pom.xml'
   pull_request:
     branches: [ main ]
+    paths:
+      - '**.py'
+      - '**.java'
+      - 'Dockerfile'
+      - '**/requirements.txt'
+      - 'pom.xml'
   workflow_dispatch:
+    inputs:
+      scan_type:
+        description: 'Type of scan to run'
+        required: true
+        default: 'all'
+        type: choice
+        options:
+        - all
+        - sast
+        - dast
+      severity_level:
+        description: 'Severity levels to scan for'
+        required: false
+        default: 'HIGH,CRITICAL'
+        type: choice
+        options:
+        - 'HIGH,CRITICAL'
+        - 'CRITICAL'
+        - 'HIGH'
+        - 'MEDIUM,HIGH,CRITICAL'
+        - 'LOW,MEDIUM,HIGH,CRITICAL'
+      target_path:
+        description: 'Path to scan (relative to repository root)'
+        required: false
+        default: '.'
+        type: string
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/python-wordstop
+  IMAGE_NAME: ${{ github.repository }}
 
 jobs:
   get-changed-files:
@@ -46,6 +84,10 @@ jobs:
   trivy-fs-scan:
     name: Trivy Filesystem Scan
     needs: get-changed-files
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.scan_type == 'all' ||
+      github.event.inputs.scan_type == 'sast'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -66,7 +108,7 @@ jobs:
             echo "Scanning Python files..." >> trivy-fs-report.txt
             trivy fs \
               --scanners vuln,secret,config \
-              --severity HIGH,CRITICAL \
+              --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
               --format json \
               --output python-scan.json \
               python_wordstop/
@@ -76,7 +118,7 @@ jobs:
             echo "Scanning Java files..." >> trivy-fs-report.txt
             trivy fs \
               --scanners vuln,secret,config \
-              --severity HIGH,CRITICAL \
+              --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
               --format json \
               --output java-scan.json \
               java_wordstop/
@@ -173,7 +215,7 @@ jobs:
             --format json \
             --output vuln-scan.json \
             --scanners vuln \
-            --severity HIGH,CRITICAL \
+            --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
             --exit-code 0 \
             "$IMAGE_TO_SCAN"
           
@@ -182,7 +224,7 @@ jobs:
             --format json \
             --output config-scan.json \
             --scanners config \
-            --severity HIGH,CRITICAL \
+            --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
             --exit-code 0 \
             "$IMAGE_TO_SCAN"
           
@@ -208,6 +250,10 @@ jobs:
   zap-scan:
     name: ZAP DAST Scan
     needs: docker-build-push
+    if: |
+      github.event_name != 'workflow_dispatch' ||
+      github.event.inputs.scan_type == 'all' ||
+      github.event.inputs.scan_type == 'dast'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
