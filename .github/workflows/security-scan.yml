@@ -1,0 +1,284 @@
+﻿name: Security Scan (SAST & DAST)
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}/python-wordstop
+
+jobs:
+  get-changed-files:
+    name: Get Changed Files
+    runs-on: ubuntu-latest
+    outputs:
+      python_changes: ${{ steps.filter.outputs.python_files }}
+      java_changes: ${{ steps.filter.outputs.java_files }}
+      all_changes: ${{ steps.filter.outputs.all_files }}
+      dockerfile_changed: ${{ steps.filter.outputs.dockerfile_changed }}
+    steps:
+      - uses: actions/checkout@v3
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: filter
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }} | tr '\n' ' ')
+          else
+            CHANGED_FILES=$(git diff --name-only HEAD^ HEAD | tr '\n' ' ')
+          fi
+          
+          PYTHON_FILES=$(echo "$CHANGED_FILES" | tr ' ' '\n' | grep -E '\.py$' | tr '\n' ' ' || echo '')
+          JAVA_FILES=$(echo "$CHANGED_FILES" | tr ' ' '\n' | grep -E '\.java$' | tr '\n' ' ' || echo '')
+          DOCKERFILE_CHANGED=$(echo "$CHANGED_FILES" | tr ' ' '\n' | grep -E 'Dockerfile|requirements\.txt' > /dev/null && echo "true" || echo "false")
+          
+          echo "python_files=$PYTHON_FILES" >> $GITHUB_OUTPUT
+          echo "java_files=$JAVA_FILES" >> $GITHUB_OUTPUT
+          echo "all_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "dockerfile_changed=$DOCKERFILE_CHANGED" >> $GITHUB_OUTPUT
+
+  trivy-fs-scan:
+    name: Trivy Filesystem Scan
+    needs: get-changed-files
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Trivy
+        run: |
+          sudo apt-get install wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy -y
+
+      - name: Run Trivy Filesystem Scan
+        run: |
+          echo "=== Running Trivy Filesystem Scan ===" > trivy-fs-report.txt
+          
+          if [ -n "${{ needs.get-changed-files.outputs.python_changes }}" ]; then
+            echo "Scanning Python files..." >> trivy-fs-report.txt
+            trivy fs \
+              --scanners vuln,secret,config \
+              --severity HIGH,CRITICAL \
+              --format json \
+              --output python-scan.json \
+              python_wordstop/
+          fi
+          
+          if [ -n "${{ needs.get-changed-files.outputs.java_changes }}" ]; then
+            echo "Scanning Java files..." >> trivy-fs-report.txt
+            trivy fs \
+              --scanners vuln,secret,config \
+              --severity HIGH,CRITICAL \
+              --format json \
+              --output java-scan.json \
+              java_wordstop/
+          fi
+          
+          echo "=== Filesystem Scan Results ===" >> trivy-fs-report.txt
+          for report in python-scan.json java-scan.json; do
+            if [ -f "$report" ]; then
+              echo "Results from $report:" >> trivy-fs-report.txt
+              jq -r '.Results[] | select(.Vulnerabilities != null or .Secrets != null or .Misconfigurations != null) | 
+                (.Vulnerabilities[]? | "[\(.Severity)] Vulnerability - \(.VulnerabilityID): \(.Title)"),
+                (.Secrets[]? | "[SECRET] Found - \(.Title): \(.Match)"),
+                (.Misconfigurations[]? | "[\(.Severity)] Misconfiguration - \(.ID): \(.Title)")' "$report" >> trivy-fs-report.txt 2>/dev/null || true
+            fi
+          done
+          echo "===================================" >> trivy-fs-report.txt
+
+      - name: Upload Filesystem Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-fs-scan-results
+          path: |
+            trivy-fs-report.txt
+            python-scan.json
+            java-scan.json
+          retention-days: 90
+
+  docker-build-push:
+    name: Build and Push Docker Image
+    needs: [get-changed-files, trivy-fs-scan]
+    if: needs.get-changed-files.outputs.python_changes != '' || needs.get-changed-files.outputs.dockerfile_changed == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata for Docker
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  trivy-image-scan:
+    name: Trivy Container Image Scan
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      security-events: write
+    steps:
+      - name: Install Trivy
+        run: |
+          sudo apt-get install wget apt-transport-https gnupg lsb-release
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install trivy -y
+
+      - name: Run Trivy Container Image Scan
+        run: |
+          echo "=== Running Trivy Container Image Scan ===" > container-scan-report.txt
+          IMAGE_TO_SCAN="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          
+          echo "Scanning for vulnerabilities..." >> container-scan-report.txt
+          trivy image \
+            --format json \
+            --output vuln-scan.json \
+            --scanners vuln \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            "$IMAGE_TO_SCAN"
+          
+          echo "Scanning for misconfigurations..." >> container-scan-report.txt
+          trivy image \
+            --format json \
+            --output config-scan.json \
+            --scanners config \
+            --severity HIGH,CRITICAL \
+            --exit-code 0 \
+            "$IMAGE_TO_SCAN"
+          
+          echo "=== Container Image Scan Results ===" >> container-scan-report.txt
+          echo "Vulnerabilities:" >> container-scan-report.txt
+          jq -r '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | "[\(.Severity)] \(.VulnerabilityID): \(.Title)"' vuln-scan.json >> container-scan-report.txt 2>/dev/null || echo "No vulnerabilities found" >> container-scan-report.txt
+          
+          echo -e "\nMisconfigurations:" >> container-scan-report.txt
+          jq -r '.Results[] | select(.Misconfigurations != null) | .Misconfigurations[] | "[\(.Severity)] \(.ID): \(.Title)"' config-scan.json >> container-scan-report.txt 2>/dev/null || echo "No misconfigurations found" >> container-scan-report.txt
+          
+          echo "===================================" >> container-scan-report.txt
+
+      - name: Upload Container Scan Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-container-scan-results
+          path: |
+            container-scan-report.txt
+            vuln-scan.json
+            config-scan.json
+          retention-days: 90
+
+  zap-scan:
+    name: ZAP DAST Scan
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Run ZAP Scan against Container
+        continue-on-error: true
+        run: |
+          # Create ZAP hook script for alert filtering
+          cat > zap-hook.py << EOL
+          def zap_started(zap, target):
+              # Ignore common alerts for demo
+              zap.alertfilter.add_alertfilter(
+                  alertid="10036",
+                  url_is_regex="true",
+                  url=".*",
+                  enabled="true")
+              zap.alertfilter.add_alertfilter(
+                  alertid="10055",
+                  url_is_regex="true",
+                  url=".*",
+                  enabled="true")
+              zap.alertfilter.add_alertfilter(
+                  alertid="10106",
+                  url_is_regex="true",
+                  url=".*",
+                  enabled="true")
+              zap.alertfilter.add_alertfilter(
+                  alertid="90004",
+                  url_is_regex="true",
+                  url=".*",
+                  enabled="true")
+          EOL
+
+          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          docker run -d --name wordstop -p 5000:5000 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+
+          # Wait for the application to start
+          sleep 10
+
+          docker pull ghcr.io/zaproxy/zaproxy:stable
+          docker run --network host \
+            -v ${PWD}:/zap/wrk/:rw \
+            --user root \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+            -t http://localhost:5000 \
+            -J zap-report.json \
+            -x zap-report.xml \
+            -r zap-report.html \
+            --hook=/zap/wrk/zap-hook.py \
+            -z "-config api.disablekey=true -config scanner.attackOnStart=true -config scanner.threadPerHost=5"
+
+      - name: Generate ZAP Report
+        if: always()
+        run: |
+          echo "=== ZAP DAST Scan Results ===" > zap-summary.txt
+          if [ -f "zap-report.json" ]; then
+            echo "Found issues:" >> zap-summary.txt
+            jq -r '.site[].alerts[] | "[\(.risk)] \(.name): \(.description)"' zap-report.json >> zap-summary.txt 2>/dev/null || echo "No issues found or invalid report format" >> zap-summary.txt
+          else
+            echo "ZAP scan completed but no report file was generated" >> zap-summary.txt
+          fi
+          echo "===============================" >> zap-summary.txt
+          cat zap-summary.txt
+
+      - name: Upload ZAP Results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: zap-scan-results
+          path: |
+            zap-summary.txt
+            zap-report.*
+          retention-days: 90

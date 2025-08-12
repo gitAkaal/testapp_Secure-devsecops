@@ -4,6 +4,7 @@ WORKDIR /app
 
 COPY python_wordstop/requirements.txt .
 RUN pip install -r requirements.txt
+RUN pip install pandas
 
 COPY python_wordstop/ .
 
