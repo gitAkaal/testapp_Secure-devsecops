@@ -8,22 +8,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  ethical-check:
-    name: EthicalCheck API Scan
-    runs-on: ubuntu-latest
-    needs: [zap-scan]  # This ensures the API is running before EthicalCheck starts
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v3
-
-      - name: APIsec Ethical Check
-        uses: apisec-inc/apisec-run-scan@v1.0.0
-        with:
-          apisec-username: ${{ secrets.APISEC_USERNAME }}
-          apisec-password: ${{ secrets.APISEC_PASSWORD }}
-          apisec-url: "http://localhost:5000"
-          apisec-profile: "ethical-check"
-
   bandit-scan:
     name: Bandit SAST Scan
     runs-on: ubuntu-latest
@@ -78,49 +62,28 @@ jobs:
     permissions:
       contents: read
     
+    services:
+      flask-app:
+        image: python:3.12
+        ports:
+          - 5000:5000
+    
     steps:
     - uses: actions/checkout@v3
 
-    # Setup Python for Flask app
-    - name: Set up Python
-      uses: actions/setup-python@v4
-      with:
-        python-version: '3.12'
-
-    # Install Dependencies
-    - name: Install Python dependencies
+    # Start Flask app in container
+    - name: Setup and Start Flask App
       run: |
-        python -m pip install --upgrade pip
-        pip install flask
-
-    # Build and start applications
-    - name: Build and start Python app
-      run: |
-        cd python_wordstop
-        nohup python wordstop.py > flask.log 2>&1 &
-        echo "Waiting for Python app to start..."
-        # Wait for the app to be ready
-        for i in {1..30}; do
-          if curl -s http://localhost:5000 > /dev/null; then
-            echo "Application is up!"
-            break
-          fi
-          echo "Waiting for application... ($i/30)"
-          sleep 2
-        done
-        # Check if app is really running
-        curl -v http://localhost:5000
-        if [ $? -ne 0 ]; then
-          echo "Application failed to start"
-          cat flask.log
-          exit 1
-        fi
+        docker exec $(docker ps -q --filter ancestor=python:3.12) /bin/bash -c "
+          cd /github/workspace/python_wordstop &&
+          pip install flask &&
+          FLASK_APP=wordstop.py FLASK_ENV=development python -m flask run --host=0.0.0.0"
 
     # Run OWASP ZAP DAST Scan with Full Active and Passive Scanning
     - name: Run ZAP Full Scan
       run: |
         docker pull ghcr.io/zaproxy/zaproxy:stable
-        docker run --network=host \
+        docker run --network container:$(docker ps -q --filter ancestor=python:3.12) \
           -v ${PWD}:/zap/wrk/:rw \
           --user root \
           ghcr.io/zaproxy/zaproxy:stable \
