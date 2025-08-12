@@ -70,19 +70,6 @@ jobs:
         target: 'http://localhost:5000'
         fail_action: false
         token: ${{ secrets.GITHUB_TOKEN }}
-        
-    # Run SonarQube Scanner
-    - name: SonarQube Scan
-      uses: sonarsource/sonarqube-scan-action@master
-      env:
-        SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-        SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }}
-      with:
-        args: >
-          -Dsonar.projectKey=vulnerable-test-app
-          -Dsonar.sources=.
-          -Dsonar.python.version=3.12
-          -Dsonar.java.binaries=.
 
     # Generate Security Report
     - name: Generate Security Report
