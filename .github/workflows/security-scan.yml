@@ -327,4 +327,4 @@ jobs:
           path: |
             zap-summary.txt
             zap-report.*
-          retention-days: 1
+          retention-days: 90
