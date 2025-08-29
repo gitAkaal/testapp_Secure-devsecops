@@ -1,4 +1,4 @@
-name: DevSecOps Security Pipeline
+name: claude opus 4.1 Security Scan Pipeline
 
 on:
   workflow_dispatch:
