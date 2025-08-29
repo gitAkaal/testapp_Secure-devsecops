@@ -3,20 +3,8 @@ name: Security Scan (SAST & DAST)
 on:
   push:
     branches: [ main ]
-    paths:
-      - '**.py'
-      - '**.java'
-      - 'Dockerfile'
-      - '**/requirements.txt'
-      - 'pom.xml'
   pull_request:
     branches: [ main ]
-    paths:
-      - '**.py'
-      - '**.java'
-      - 'Dockerfile'
-      - '**/requirements.txt'
-      - 'pom.xml'
   workflow_dispatch:
     inputs:
       scan_type:
