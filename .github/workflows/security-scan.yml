@@ -1,5 +1,9 @@
 name: Security Scan (SAST & DAST)
 
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
 on:
   push:
     branches: [ main ]
@@ -33,10 +37,6 @@ on:
         default: '.'
         type: string
 
-env:
-  REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}
-
 jobs:
   get-changed-files:
     name: Get Changed Files
@@ -53,9 +53,12 @@ jobs:
 
       - name: Get changed files
         id: filter
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          if [ "${{ github.event_name }}" == "pull_request" ]; then
-            CHANGED_FILES=$(git diff --name-only origin/${{ github.base_ref }} | tr '\n' ' ')
+          if [ "$EVENT_NAME" == "pull_request" ]; then
+            CHANGED_FILES=$(git diff --name-only origin/"$BASE_REF" | tr '\n' ' ')
           else
             CHANGED_FILES=$(git diff --name-only HEAD^ HEAD | tr '\n' ' ')
           fi
@@ -68,6 +71,85 @@ jobs:
           echo "java_files=$JAVA_FILES" >> $GITHUB_OUTPUT
           echo "all_files=$CHANGED_FILES" >> $GITHUB_OUTPUT
           echo "dockerfile_changed=$DOCKERFILE_CHANGED" >> $GITHUB_OUTPUT
+
+  bandit-sast:
+    name: Bandit SAST Scan
+    needs: get-changed-files
+    if: |
+      (github.event_name != 'workflow_dispatch') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.scan_type == 'all' || github.event.inputs.scan_type == 'sast'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.x'
+
+      - name: Install Bandit
+        run: pip install bandit
+
+      - name: Run Bandit SAST Scan
+        run: |
+          echo "=== Running Bandit SAST Scan ===" > bandit-report.txt
+          bandit -r python_wordstop -f json -o bandit-results.json || true
+          echo "Scan Results:" >> bandit-report.txt
+          jq -r '.results[] | "[\(.issue_severity)] \(.issue_text) in \(.filename)"' bandit-results.json >> bandit-report.txt || echo "No issues found" >> bandit-report.txt
+
+      - name: Upload Bandit Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: bandit-scan-results
+          path: |
+            bandit-report.txt
+            bandit-results.json
+          retention-days: 90
+
+  owasp-dependency-check:
+    name: OWASP Dependency Check
+    needs: get-changed-files
+    if: |
+      (github.event_name != 'workflow_dispatch') ||
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.scan_type == 'all' || github.event.inputs.scan_type == 'sast'))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up JDK
+        uses: actions/setup-java@v3
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+
+      - name: Run OWASP Dependency Check - Java
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'java-wordstop'
+          path: 'java_wordstop'
+          format: 'HTML JSON'
+          args: >
+            --failOnCVSS 7
+            --enableRetired
+
+      - name: Run pip-audit for Python Dependencies
+        run: |
+          pip install pip-audit
+          cd python_wordstop
+          pip-audit -r requirements.txt -f json > pip-audit-results.json || true
+          echo "=== Python Dependencies Scan Results ===" > pip-audit-report.txt
+          jq -r '.[] | "[\(.severity)] \(.name) \(.version): \(.vulnerabilities[].id)"' pip-audit-results.json >> pip-audit-report.txt || echo "No issues found" >> pip-audit-report.txt
+
+      - name: Upload Dependency Check Results
+        uses: actions/upload-artifact@v4
+        with:
+          name: dependency-check-results
+          path: |
+            dependency-check-report.html
+            dependency-check-report.json
+            pip-audit-results.json
+            pip-audit-report.txt
+          retention-days: 90
 
   trivy-fs-scan:
     name: Trivy Filesystem Scan
@@ -88,24 +170,28 @@ jobs:
           sudo apt-get install trivy -y
 
       - name: Run Trivy Filesystem Scan
+        env:
+          PYTHON_CHANGES: ${{ needs.get-changed-files.outputs.python_changes }}
+          JAVA_CHANGES: ${{ needs.get-changed-files.outputs.java_changes }}
+          SEVERITY: ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }}
         run: |
           echo "=== Running Trivy Filesystem Scan ===" > trivy-fs-report.txt
           
-          if [ -n "${{ needs.get-changed-files.outputs.python_changes }}" ]; then
+          if [ -n "$PYTHON_CHANGES" ]; then
             echo "Scanning Python files..." >> trivy-fs-report.txt
             trivy fs \
               --scanners vuln,secret,config \
-              --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
+              --severity "$SEVERITY" \
               --format json \
               --output python-scan.json \
               python_wordstop/
           fi
           
-          if [ -n "${{ needs.get-changed-files.outputs.java_changes }}" ]; then
+          if [ -n "$JAVA_CHANGES" ]; then
             echo "Scanning Java files..." >> trivy-fs-report.txt
             trivy fs \
               --scanners vuln,secret,config \
-              --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
+              --severity "$SEVERITY" \
               --format json \
               --output java-scan.json \
               java_wordstop/
@@ -163,9 +249,11 @@ jobs:
 
       - name: Extract metadata for Java Docker image
         id: meta-java
+        env:
+          REPO: ${{ github.repository }}
         uses: docker/metadata-action@v5
         with:
-          images: ${{ env.REGISTRY }}/${{ github.repository }}/java-wordstop
+          images: ${{ env.REGISTRY }}/${{ env.REPO }}/java-wordstop
           tags: |
             type=sha,format=long
             type=ref,event=branch
@@ -184,16 +272,20 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Run Trivy vulnerability scanner on Java image
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+          SEVERITY: ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }}
         run: |
           echo "=== Running Trivy Java Container Scan ===" > java-container-scan.txt
-          IMAGE_TO_SCAN="${{ env.REGISTRY }}/${{ github.repository }}/java-wordstop:sha-${{ github.sha }}"
+          REPO="${{ github.repository }}"
+          IMAGE_TO_SCAN="$REGISTRY/$REPO/java-wordstop:$IMAGE_TAG"
           
           echo "Scanning for vulnerabilities..." >> java-container-scan.txt
           trivy image \
             --format json \
             --output java-vuln-scan.json \
             --scanners vuln \
-            --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
+            --severity "$SEVERITY" \
             --exit-code 0 \
             "$IMAGE_TO_SCAN"
 
@@ -210,7 +302,7 @@ jobs:
             java-sbom.json
           retention-days: 90
 
-  docker-build-push:
+  python-docker-build:
     name: Build and Push Python Docker Image
     needs: [get-changed-files, trivy-fs-scan]
     if: needs.get-changed-files.outputs.python_changes != '' || needs.get-changed-files.outputs.dockerfile_changed == 'true'
@@ -234,8 +326,10 @@ jobs:
       - name: Extract metadata for Docker
         id: meta
         uses: docker/metadata-action@v5
+        env:
+          REPO: ${{ github.repository }}
         with:
-          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          images: ${{ env.REGISTRY }}/${{ env.REPO }}
           tags: |
             type=sha,format=long
             type=ref,event=branch
@@ -245,7 +339,7 @@ jobs:
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
-          context: .
+          context: python_wordstop
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
@@ -254,7 +348,7 @@ jobs:
 
   trivy-image-scan:
     name: Trivy Container Image Scan
-    needs: docker-build-push
+    needs: [python-docker-build, java-docker-build]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -270,34 +364,51 @@ jobs:
           sudo apt-get install trivy -y
 
       - name: Run Trivy Container Image Scan
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
+          SEVERITY: ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }}
         run: |
           echo "=== Running Trivy Container Image Scan ===" > container-scan-report.txt
-          IMAGE_TO_SCAN="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}"
+          IMAGE_TO_SCAN="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+          REPO="${{ github.repository }}"
+          JAVA_IMAGE_TO_SCAN="$REGISTRY/$REPO/java-wordstop:$IMAGE_TAG"
           
-          echo "Scanning for vulnerabilities..." >> container-scan-report.txt
+          echo "Scanning Python container for vulnerabilities..." >> container-scan-report.txt
           trivy image \
             --format json \
-            --output vuln-scan.json \
+            --output python-vuln-scan.json \
             --scanners vuln \
-            --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
+            --severity "$SEVERITY" \
             --exit-code 0 \
             "$IMAGE_TO_SCAN"
           
-          echo "Scanning for misconfigurations..." >> container-scan-report.txt
+          echo "Scanning Python container for misconfigurations..." >> container-scan-report.txt
           trivy image \
             --format json \
-            --output config-scan.json \
+            --output python-config-scan.json \
             --scanners config \
-            --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
+            --severity "$SEVERITY" \
             --exit-code 0 \
             "$IMAGE_TO_SCAN"
+
+          echo "Scanning Java container for vulnerabilities..." >> container-scan-report.txt
+          trivy image \
+            --format json \
+            --output java-vuln-scan.json \
+            --scanners vuln \
+            --severity "$SEVERITY" \
+            --exit-code 0 \
+            "$JAVA_IMAGE_TO_SCAN"
           
           echo "=== Container Image Scan Results ===" >> container-scan-report.txt
-          echo "Vulnerabilities:" >> container-scan-report.txt
-          jq -r '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | "[\(.Severity)] \(.VulnerabilityID): \(.Title)"' vuln-scan.json >> container-scan-report.txt 2>/dev/null || echo "No vulnerabilities found" >> container-scan-report.txt
+          echo "Python Container Vulnerabilities:" >> container-scan-report.txt
+          jq -r '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | "[\(.Severity)] \(.VulnerabilityID): \(.Title)"' python-vuln-scan.json >> container-scan-report.txt 2>/dev/null || echo "No vulnerabilities found" >> container-scan-report.txt
           
-          echo -e "\nMisconfigurations:" >> container-scan-report.txt
-          jq -r '.Results[] | select(.Misconfigurations != null) | .Misconfigurations[] | "[\(.Severity)] \(.ID): \(.Title)"' config-scan.json >> container-scan-report.txt 2>/dev/null || echo "No misconfigurations found" >> container-scan-report.txt
+          echo -e "\nPython Container Misconfigurations:" >> container-scan-report.txt
+          jq -r '.Results[] | select(.Misconfigurations != null) | .Misconfigurations[] | "[\(.Severity)] \(.ID): \(.Title)"' python-config-scan.json >> container-scan-report.txt 2>/dev/null || echo "No misconfigurations found" >> container-scan-report.txt
+
+          echo -e "\nJava Container Vulnerabilities:" >> container-scan-report.txt
+          jq -r '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | "[\(.Severity)] \(.VulnerabilityID): \(.Title)"' java-vuln-scan.json >> container-scan-report.txt 2>/dev/null || echo "No vulnerabilities found" >> container-scan-report.txt
           
           echo "===================================" >> container-scan-report.txt
 
@@ -307,13 +418,14 @@ jobs:
           name: trivy-container-scan-results
           path: |
             container-scan-report.txt
-            vuln-scan.json
-            config-scan.json
+            python-vuln-scan.json
+            python-config-scan.json
+            java-vuln-scan.json
           retention-days: 90
 
   zap-scan:
     name: ZAP DAST Scan
-    needs: docker-build-push
+    needs: [python-docker-build, java-docker-build]
     if: |
       github.event_name != 'workflow_dispatch' ||
       (github.event_name == 'workflow_dispatch' && (github.event.inputs.scan_type == 'all' || github.event.inputs.scan_type == 'dast'))
@@ -321,7 +433,9 @@ jobs:
     steps:
       - uses: actions/checkout@v3
 
-      - name: Run ZAP Scan against Container
+      - name: Run ZAP Scan against Containers
+        env:
+          IMAGE_TAG: sha-${{ github.sha }}
         continue-on-error: true
         run: |
           # Create ZAP hook script for alert filtering
@@ -350,12 +464,21 @@ jobs:
                   enabled="true")
           EOL
 
-          docker pull ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
-          docker run -d --name wordstop -p 5000:5000 ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:sha-${{ github.sha }}
+          # Start Python container
+          PYTHON_IMAGE="$REGISTRY/$IMAGE_NAME:$IMAGE_TAG"
+          REPO="${{ github.repository }}"
+          JAVA_IMAGE="$REGISTRY/$REPO/java-wordstop:$IMAGE_TAG"
+          docker pull "$PYTHON_IMAGE"
+          docker run -d --name python-wordstop -p 5000:5000 "$PYTHON_IMAGE"
 
-          # Wait for the application to start
+          # Start Java container
+          docker pull "$JAVA_IMAGE"
+          docker run -d --name java-wordstop -p 8080:8080 "$JAVA_IMAGE"
+
+          # Wait for the applications to start
           sleep 10
 
+          # Run ZAP scan against Python app
           docker pull ghcr.io/zaproxy/zaproxy:stable
           docker run --network host \
             -v ${PWD}:/zap/wrk/:rw \
@@ -363,21 +486,39 @@ jobs:
             ghcr.io/zaproxy/zaproxy:stable \
             zap-full-scan.py \
             -t http://localhost:5000 \
-            -J zap-report.json \
-            -x zap-report.xml \
-            -r zap-report.html \
+            -J zap-report-python.json \
+            -x zap-report-python.xml \
+            -r zap-report-python.html \
             --hook=/zap/wrk/zap-hook.py \
             -z "-config api.disablekey=true -config scanner.attackOnStart=true -config scanner.threadPerHost=5"
 
-      - name: Generate ZAP Report
+          # Run ZAP scan against Java app
+          docker run --network host \
+            -v ${PWD}:/zap/wrk/:rw \
+            --user root \
+            ghcr.io/zaproxy/zaproxy:stable \
+            zap-full-scan.py \
+            -t http://localhost:8080 \
+            -J zap-report-java.json \
+            -x zap-report-java.xml \
+            -r zap-report-java.html \
+            --hook=/zap/wrk/zap-hook.py \
+            -z "-config api.disablekey=true -config scanner.attackOnStart=true -config scanner.threadPerHost=5"
+
+      - name: Generate Combined ZAP Report
         if: always()
         run: |
           echo "=== ZAP DAST Scan Results ===" > zap-summary.txt
-          if [ -f "zap-report.json" ]; then
+          echo "Python Application Results:" >> zap-summary.txt
+          if [ -f "zap-report-python.json" ]; then
             echo "Found issues:" >> zap-summary.txt
-            jq -r '.site[].alerts[] | "[\(.risk)] \(.name): \(.description)"' zap-report.json >> zap-summary.txt 2>/dev/null || echo "No issues found or invalid report format" >> zap-summary.txt
-          else
-            echo "ZAP scan completed but no report file was generated" >> zap-summary.txt
+            jq -r '.site[].alerts[] | "[\(.risk)] \(.name): \(.description)"' zap-report-python.json >> zap-summary.txt 2>/dev/null || echo "No issues found or invalid report format" >> zap-summary.txt
+          fi
+
+          echo -e "\nJava Application Results:" >> zap-summary.txt
+          if [ -f "zap-report-java.json" ]; then
+            echo "Found issues:" >> zap-summary.txt
+            jq -r '.site[].alerts[] | "[\(.risk)] \(.name): \(.description)"' zap-report-java.json >> zap-summary.txt 2>/dev/null || echo "No issues found or invalid report format" >> zap-summary.txt
           fi
           echo "===============================" >> zap-summary.txt
           cat zap-summary.txt
@@ -389,5 +530,7 @@ jobs:
           name: zap-scan-results
           path: |
             zap-summary.txt
-            zap-report.*
+            zap-report-*.json
+            zap-report-*.xml
+            zap-report-*.html
           retention-days: 1
