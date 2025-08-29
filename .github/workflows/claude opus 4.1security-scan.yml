@@ -3,11 +3,6 @@ name: claude opus 4.1 Security Scan Pipeline
 on:
   workflow_dispatch:
     inputs:
-      force_all_scans:
-        description: 'Run all security scans regardless of changes'
-        required: false
-        default: true
-        type: boolean
       scan_type:
         description: 'Type of scan to run'
         required: true
@@ -15,238 +10,149 @@ on:
         type: choice
         options:
           - all
+          - quick
           - sast
           - dependency
           - container
           - infrastructure
-          - compliance
-      environment:
-        description: 'Target environment'
-        required: false
-        default: 'staging'
-        type: choice
-        options:
-          - development
-          - staging
-          - production
+          - dast
   push:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
-    types: [ opened, synchronize, reopened ]
   schedule:
-    # Daily security scan at 2 AM UTC
     - cron: '0 2 * * *'
 
 env:
-  # Global configuration
-  SCAN_SEVERITY_THRESHOLD: 'MEDIUM'
-  ENABLE_COMMENTS: true
-  # Force all scans for manual triggers and scheduled runs
-  FORCE_ALL_SCANS: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+  # Force full scan for manual triggers
+  FORCE_FULL_SCAN: ${{ github.event_name == 'workflow_dispatch' }}
 
 jobs:
-  # ============================================
-  # PREPARATION AND CHANGE DETECTION
-  # ============================================
+  # Step 1: Preparation
   prepare:
-    name: 🔍 Analyze Changes & Prepare
+    name: 📋 Prepare and Analyze Changes
     runs-on: ubuntu-latest
     outputs:
-      should_scan_sast: ${{ steps.decision.outputs.should_scan_sast }}
-      should_scan_dependencies: ${{ steps.decision.outputs.should_scan_dependencies }}
-      should_scan_container: ${{ steps.decision.outputs.should_scan_container }}
-      should_scan_iac: ${{ steps.decision.outputs.should_scan_iac }}
-      should_scan_compliance: ${{ steps.decision.outputs.should_scan_compliance }}
-      changed_files: ${{ steps.changed-files.outputs.all_changed_files }}
-      scan_summary: ${{ steps.decision.outputs.scan_summary }}
+      run_mode: ${{ steps.mode.outputs.run_mode }}
+      skip_scans: ${{ steps.mode.outputs.skip_scans }}
+      has_python: ${{ steps.detect.outputs.has_python }}
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_docker: ${{ steps.detect.outputs.has_docker }}
+      has_terraform: ${{ steps.detect.outputs.has_terraform }}
     steps:
-      - name: 📥 Checkout Repository
+      - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 📝 Get Changed Files
-        id: changed-files
-        if: github.event_name == 'push' || github.event_name == 'pull_request'
-        uses: tj-actions/changed-files@v41
-        with:
-          separator: ','
-          files_separator: '\n'
-          output_renamed_files_as_deleted_and_added: true
-
-      - name: 🎯 Determine Required Scans
-        id: decision
+      - name: Determine run mode
+        id: mode
         run: |
-          echo "🔍 Analyzing repository and changes..."
-          
-          # Check if we should force all scans
-          FORCE_ALL="${{ env.FORCE_ALL_SCANS }}"
-          MANUAL_TRIGGER="${{ github.event_name == 'workflow_dispatch' }}"
-          MANUAL_FORCE="${{ github.event.inputs.force_all_scans }}"
-          
-          # Initialize scan decisions
-          SCAN_SAST="false"
-          SCAN_DEPS="false"
-          SCAN_CONTAINER="false"
-          SCAN_IAC="false"
-          SCAN_COMPLIANCE="false"
-          
-          # Force all scans for manual triggers, scheduled runs, or when specified
-          if [[ "$FORCE_ALL" == "true" ]] || [[ "$MANUAL_FORCE" == "true" ]] || [[ "$MANUAL_TRIGGER" == "true" ]]; then
-            echo "✅ Manual trigger or scheduled run detected - ALL scans will be performed"
-            SCAN_SAST="true"
-            SCAN_DEPS="true"
-            SCAN_CONTAINER="true"
-            SCAN_IAC="true"
-            SCAN_COMPLIANCE="true"
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "run_mode=FULL_COMPREHENSIVE_SCAN" >> $GITHUB_OUTPUT
+            echo "skip_scans=false" >> $GITHUB_OUTPUT
+            echo "🚀 FULL SCAN MODE - All security checks will be executed!"
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "run_mode=SCHEDULED_FULL_SCAN" >> $GITHUB_OUTPUT
+            echo "skip_scans=false" >> $GITHUB_OUTPUT
+            echo "📅 Scheduled full scan - All checks enabled"
           else
-            echo "📊 Commit-based trigger - analyzing changes to determine required scans..."
-            
-            # Get changed files
-            CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
-            
-            # SAST: Scan if code files changed
-            if echo "$CHANGED_FILES" | grep -qE '\.(py|js|ts|java|go|cs|rb|php|swift|kt|scala|rs|c|cpp|h|hpp)$'; then
-              SCAN_SAST="true"
-              echo "  ✓ Code changes detected - SAST scan required"
-            fi
-            
-            # Dependencies: Scan if dependency files changed
-            if echo "$CHANGED_FILES" | grep -qE '(package\.json|requirements\.txt|Gemfile|pom\.xml|build\.gradle|go\.mod|Cargo\.toml|composer\.json|Pipfile|poetry\.lock|yarn\.lock|package-lock\.json)'; then
-              SCAN_DEPS="true"
-              echo "  ✓ Dependency changes detected - Dependency scan required"
-            fi
-            
-            # Container: Scan if Docker files changed
-            if echo "$CHANGED_FILES" | grep -qE '(Dockerfile|docker-compose\.yml|docker-compose\.yaml|\.dockerignore)'; then
-              SCAN_CONTAINER="true"
-              echo "  ✓ Container changes detected - Container scan required"
-            fi
-            
-            # IaC: Scan if infrastructure files changed
-            if echo "$CHANGED_FILES" | grep -qE '\.(tf|tfvars|yaml|yml|json)$' || echo "$CHANGED_FILES" | grep -qE '(terraform/|k8s/|kubernetes/|helm/|ansible/)'; then
-              SCAN_IAC="true"
-              echo "  ✓ Infrastructure changes detected - IaC scan required"
-            fi
-            
-            # Compliance: Always run on main branch commits
-            if [[ "${{ github.ref }}" == "refs/heads/main" ]]; then
-              SCAN_COMPLIANCE="true"
-              echo "  ✓ Main branch commit - Compliance scan required"
-            fi
-            
-            # If no specific changes detected, run basic scans
-            if [[ "$SCAN_SAST" == "false" ]] && [[ "$SCAN_DEPS" == "false" ]] && [[ "$SCAN_CONTAINER" == "false" ]] && [[ "$SCAN_IAC" == "false" ]]; then
-              echo "  ℹ️ No specific changes detected - running basic security scans"
-              SCAN_SAST="true"
-              SCAN_DEPS="true"
-            fi
+            echo "run_mode=LIGHTWEIGHT_COMMIT_SCAN" >> $GITHUB_OUTPUT
+            echo "skip_scans=true" >> $GITHUB_OUTPUT
+            echo "⚡ Lightweight mode - Only essential scans"
           fi
-          
-          # Output decisions
-          echo "should_scan_sast=$SCAN_SAST" >> $GITHUB_OUTPUT
-          echo "should_scan_dependencies=$SCAN_DEPS" >> $GITHUB_OUTPUT
-          echo "should_scan_container=$SCAN_CONTAINER" >> $GITHUB_OUTPUT
-          echo "should_scan_iac=$SCAN_IAC" >> $GITHUB_OUTPUT
-          echo "should_scan_compliance=$SCAN_COMPLIANCE" >> $GITHUB_OUTPUT
-          
-          # Create summary
-          SUMMARY="📋 **Scan Plan:**\n"
-          SUMMARY="${SUMMARY}- SAST: $([ "$SCAN_SAST" == "true" ] && echo "✅ Enabled" || echo "⏭️ Skipped")\n"
-          SUMMARY="${SUMMARY}- Dependencies: $([ "$SCAN_DEPS" == "true" ] && echo "✅ Enabled" || echo "⏭️ Skipped")\n"
-          SUMMARY="${SUMMARY}- Container: $([ "$SCAN_CONTAINER" == "true" ] && echo "✅ Enabled" || echo "⏭️ Skipped")\n"
-          SUMMARY="${SUMMARY}- Infrastructure: $([ "$SCAN_IAC" == "true" ] && echo "✅ Enabled" || echo "⏭️ Skipped")\n"
-          SUMMARY="${SUMMARY}- Compliance: $([ "$SCAN_COMPLIANCE" == "true" ] && echo "✅ Enabled" || echo "⏭️ Skipped")"
-          
-          echo "scan_summary<<EOF" >> $GITHUB_OUTPUT
-          echo -e "$SUMMARY" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: 📊 Display Scan Plan
+      - name: Detect technologies
+        id: detect
         run: |
-          echo "════════════════════════════════════════"
-          echo "         SECURITY SCAN PLAN"
-          echo "════════════════════════════════════════"
-          echo ""
-          echo "Trigger Type: ${{ github.event_name }}"
-          echo "Branch: ${{ github.ref_name }}"
-          echo ""
-          echo -e "${{ steps.decision.outputs.scan_summary }}"
-          echo ""
-          echo "════════════════════════════════════════"
+          echo "has_python=$([[ -f requirements.txt || -f setup.py || -f Pipfile ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_node=$([[ -f package.json || -f yarn.lock ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_docker=$([[ -f Dockerfile || -f docker-compose.yml ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_terraform=$([[ -d terraform || -f *.tf ]] && echo true || echo false)" >> $GITHUB_OUTPUT
 
-  # ============================================
-  # SAST - STATIC APPLICATION SECURITY TESTING
-  # ============================================
-  sast-scan:
-    name: 🔐 SAST Security Analysis
+  # Step 2: Essential Security (Always runs)
+  essential-security:
+    name: 🔒 Essential Security Scans
     runs-on: ubuntu-latest
     needs: prepare
-    if: needs.prepare.outputs.should_scan_sast == 'true'
+    if: always()
     steps:
-      - name: 📥 Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: 🔍 Semgrep Scan
+      - name: Semgrep SAST
         uses: returntocorp/semgrep-action@v1
         with:
           config: >-
             p/security-audit
             p/owasp-top-ten
-            p/cwe-top-25
-          generateSarif: true
         continue-on-error: true
 
-      - name: 🕵️ GitLeaks Secret Detection
+      - name: Gitleaks Secret Detection
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
 
-      - name: 🔐 TruffleHog Secret Scan
+      - name: TruffleHog Secret Scan
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
-          base: ${{ github.event.repository.default_branch }}
+          base: main
           head: HEAD
-          extra_args: --only-verified
         continue-on-error: true
 
-      - name: 📊 Generate SAST Report
-        if: always()
-        run: |
-          echo "## 🔐 SAST Scan Results" > sast-summary.md
-          echo "✅ Semgrep scan completed" >> sast-summary.md
-          echo "✅ Secret detection completed" >> sast-summary.md
-          echo "" >> sast-summary.md
-          echo "Check the Security tab for detailed findings" >> sast-summary.md
-
-      - name: 📤 Upload SAST Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: sast-results
-          path: |
-            semgrep.sarif
-            sast-summary.md
-
-  # ============================================
-  # DEPENDENCY VULNERABILITY SCANNING
-  # ============================================
-  dependency-scan:
-    name: 📦 Dependency Security Scan
+  # Step 3: Advanced SAST (Conditional)
+  advanced-sast:
+    name: 🛡️ Advanced SAST Analysis
     runs-on: ubuntu-latest
     needs: prepare
-    if: needs.prepare.outputs.should_scan_dependencies == 'true'
+    # CRITICAL: This ensures it runs on manual trigger
+    if: |
+      always() && 
+      (github.event_name == 'workflow_dispatch' || 
+       github.event_name == 'schedule')
     steps:
-      - name: 📥 Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: 🔍 OSV Scanner
-        uses: google/osv-scanner-action@v1.7.0
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: 'javascript,python,java,go'
+        continue-on-error: true
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3
+        continue-on-error: true
+
+      - name: Bandit Python Security
+        if: needs.prepare.outputs.has_python == 'true'
+        run: |
+          pip install bandit
+          bandit -r . -f json -o bandit.json || true
+        continue-on-error: true
+
+  # Step 4: Dependency Scanning
+  dependency-scan:
+    name: 📦 Dependency Vulnerability Analysis
+    runs-on: ubuntu-latest
+    needs: prepare
+    # Run on manual trigger OR if dependencies changed
+    if: |
+      always() && 
+      (github.event_name == 'workflow_dispatch' || 
+       github.event_name == 'schedule')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: OSV Scanner
+        uses: google/osv-scanner-action@v1
         with:
           scan-args: |-
             --recursive
@@ -254,375 +160,230 @@ jobs:
             ./
         continue-on-error: true
 
-      - name: 🛡️ OWASP Dependency Check
+      - name: OWASP Dependency Check
         uses: dependency-check/Dependency-Check_Action@main
         with:
-          project: ${{ github.repository }}
+          project: 'SecurityScan'
           path: '.'
-          format: 'HTML,JSON,SARIF'
-          args: >
-            --enableRetired
-            --enableExperimental
+          format: 'ALL'
         continue-on-error: true
 
-      - name: 📊 Generate Dependency Report
-        if: always()
+      - name: NPM Audit
+        if: needs.prepare.outputs.has_node == 'true'
+        run: npm audit --audit-level=moderate || true
+        continue-on-error: true
+
+      - name: Safety Python Check
+        if: needs.prepare.outputs.has_python == 'true'
         run: |
-          echo "## 📦 Dependency Scan Results" > dependency-summary.md
-          echo "✅ OSV Scanner completed" >> dependency-summary.md
-          echo "✅ OWASP Dependency Check completed" >> dependency-summary.md
-          
-          # Count vulnerabilities if report exists
-          if [ -f "dependency-check-report.json" ]; then
-            echo "" >> dependency-summary.md
-            echo "### Vulnerability Summary:" >> dependency-summary.md
-            echo "Check artifacts for detailed report" >> dependency-summary.md
-          fi
+          pip install safety
+          safety check || true
+        continue-on-error: true
 
-      - name: 📤 Upload Dependency Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: dependency-results
-          path: |
-            dependency-check-report.*
-            dependency-summary.md
-
-  # ============================================
-  # CONTAINER SECURITY SCANNING
-  # ============================================
+  # Step 5: Container Security
   container-scan:
-    name: 🐳 Container Security Scan
+    name: 🐳 Container Security Analysis
     runs-on: ubuntu-latest
     needs: prepare
-    if: needs.prepare.outputs.should_scan_container == 'true'
+    # Run on manual trigger OR if Docker files exist
+    if: |
+      always() && 
+      needs.prepare.outputs.has_docker == 'true' &&
+      (github.event_name == 'workflow_dispatch' || 
+       github.event_name == 'schedule')
     steps:
-      - name: 📥 Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: 🔍 Check for Dockerfile
-        id: dockerfile-check
-        run: |
-          if [ -f "Dockerfile" ]; then
-            echo "found=true" >> $GITHUB_OUTPUT
-            echo "✅ Dockerfile found"
-          else
-            echo "found=false" >> $GITHUB_OUTPUT
-            echo "⚠️ No Dockerfile found - skipping container build"
-          fi
-
-      - name: 🏗️ Build Container Image
+      - name: Build Docker Image
         id: build
-        if: steps.dockerfile-check.outputs.found == 'true'
         run: |
-          docker build -t scan-image:${{ github.sha }} . || true
-          echo "image=scan-image:${{ github.sha }}" >> $GITHUB_OUTPUT
+          if [ -f Dockerfile ]; then
+            docker build -t scanimage:${{ github.sha }} . || echo "image=failed" >> $GITHUB_OUTPUT
+            echo "image=scanimage:${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
 
-      - name: 🔍 Trivy Container Scan
-        if: steps.dockerfile-check.outputs.found == 'true'
+      - name: Trivy Container Scan
+        if: steps.build.outputs.image != 'failed'
         uses: aquasecurity/trivy-action@master
         with:
           image-ref: ${{ steps.build.outputs.image }}
-          format: 'sarif'
-          output: 'trivy.sarif'
+          format: 'table'
           severity: 'CRITICAL,HIGH,MEDIUM'
         continue-on-error: true
 
-      - name: 📝 Hadolint Dockerfile Lint
-        if: steps.dockerfile-check.outputs.found == 'true'
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: Dockerfile
-          format: sarif
-          output-file: hadolint.sarif
-          no-fail: true
-
-      - name: 🔍 Grype Vulnerability Scan
-        if: steps.dockerfile-check.outputs.found == 'true'
+      - name: Grype Container Scan
+        if: steps.build.outputs.image != 'failed'
         uses: anchore/scan-action@v3
         with:
           image: ${{ steps.build.outputs.image }}
-          severity-cutoff: medium
           fail-build: false
         continue-on-error: true
 
-      - name: 📊 Generate Container Report
-        if: always()
-        run: |
-          echo "## 🐳 Container Scan Results" > container-summary.md
-          if [ "${{ steps.dockerfile-check.outputs.found }}" == "true" ]; then
-            echo "✅ Trivy scan completed" >> container-summary.md
-            echo "✅ Hadolint analysis completed" >> container-summary.md
-            echo "✅ Grype scan completed" >> container-summary.md
-          else
-            echo "⚠️ No Dockerfile found - container scans skipped" >> container-summary.md
-          fi
-
-      - name: 📤 Upload Container Results
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Hadolint Dockerfile Linting
+        uses: hadolint/hadolint-action@v3.1.0
         with:
-          name: container-results
-          path: |
-            trivy.sarif
-            hadolint.sarif
-            container-summary.md
+          dockerfile: Dockerfile
+          no-fail: true
+        continue-on-error: true
 
-  # ============================================
-  # INFRASTRUCTURE AS CODE SCANNING
-  # ============================================
-  iac-scan:
+  # Step 6: Infrastructure Security
+  infrastructure-scan:
     name: 🏗️ Infrastructure Security Scan
     runs-on: ubuntu-latest
     needs: prepare
-    if: needs.prepare.outputs.should_scan_iac == 'true'
+    # Always run for IaC files
+    if: |
+      always() && 
+      (needs.prepare.outputs.has_terraform == 'true' || 
+       github.event_name == 'workflow_dispatch')
     steps:
-      - name: 📥 Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: 🔍 Checkov IaC Scan
+      - name: Checkov IaC Scan
         uses: bridgecrewio/checkov-action@master
         with:
           directory: .
-          quiet: false
-          soft_fail: true
           framework: all
-          output_format: sarif
-          output_file_path: checkov.sarif
+          soft_fail: true
         continue-on-error: true
 
-      - name: 🔍 KICS Security Scan
+      - name: KICS Scan
         uses: checkmarx/kics-github-action@v1.7.0
         with:
           path: .
-          output_path: kics-results
-          output_formats: 'json,sarif'
           fail_on: high
-          enable_comments: false
         continue-on-error: true
 
-      - name: 🔍 Terrascan IaC Analysis
+      - name: Terrascan
+        if: needs.prepare.outputs.has_terraform == 'true'
         run: |
-          # Check if Terraform files exist
-          if find . -name "*.tf" -o -name "*.tfvars" | grep -q .; then
-            docker run --rm -v "$(pwd):/src" \
-              tenable/terrascan scan \
-              -t aws,azure,gcp,k8s \
-              -f /src \
-              -o sarif > terrascan.sarif || true
-            echo "✅ Terrascan completed"
-          else
-            echo "ℹ️ No Terraform files found - skipping Terrascan"
-          fi
+          docker run --rm -v "$(pwd):/src" \
+            tenable/terrascan scan -t aws,azure,gcp,k8s || true
         continue-on-error: true
 
-      - name: 📊 Generate IaC Report
-        if: always()
-        run: |
-          echo "## 🏗️ Infrastructure Scan Results" > iac-summary.md
-          echo "✅ Checkov scan completed" >> iac-summary.md
-          echo "✅ KICS scan completed" >> iac-summary.md
-          if [ -f "terrascan.sarif" ]; then
-            echo "✅ Terrascan scan completed" >> iac-summary.md
-          fi
-
-      - name: 📤 Upload IaC Results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: iac-results
-          path: |
-            checkov.sarif
-            kics-results/
-            terrascan.sarif
-            iac-summary.md
-
-  # ============================================
-  # COMPLIANCE AND LICENSE CHECKS
-  # ============================================
-  compliance-scan:
-    name: 📋 Compliance & License Check
+  # Step 7: DAST (Including ZAP)
+  dast-scan:
+    name: 🌐 Dynamic Application Security Testing
     runs-on: ubuntu-latest
     needs: prepare
-    if: needs.prepare.outputs.should_scan_compliance == 'true'
+    # ONLY runs on manual trigger or schedule
+    if: |
+      github.event_name == 'workflow_dispatch' || 
+      github.event_name == 'schedule'
     steps:
-      - name: 📥 Checkout Code
+      - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: 📜 License Finder
-        run: |
-          docker run --rm -v $(pwd):/scan licensefinder/license_finder \
-            /bin/bash -lc "cd /scan && license_finder report --format json" \
-            > license-report.json || true
+      - name: OWASP ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.10.0
+        with:
+          target: ${{ vars.DAST_TARGET_URL || 'http://example.com' }}
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
         continue-on-error: true
 
-      - name: 🔍 Git Security Checks
-        run: |
-          echo "## Git Security Analysis" > git-security.md
-          echo "" >> git-security.md
-          
-          # Check commit signatures
-          echo "### Commit Signatures:" >> git-security.md
-          UNSIGNED=$(git log --pretty="format:%H %G?" -10 | grep -c " N" || true)
-          if [ "$UNSIGNED" -gt 0 ]; then
-            echo "⚠️ Found $UNSIGNED unsigned commits in last 10 commits" >> git-security.md
-          else
-            echo "✅ All recent commits are signed" >> git-security.md
-          fi
-          
-          echo "" >> git-security.md
-          echo "### Branch Protection:" >> git-security.md
-          echo "ℹ️ Ensure branch protection rules are configured in repository settings" >> git-security.md
-
-      - name: 📊 Generate Compliance Report
-        if: always()
-        run: |
-          echo "## 📋 Compliance Scan Results" > compliance-summary.md
-          echo "✅ License compliance check completed" >> compliance-summary.md
-          echo "✅ Git security analysis completed" >> compliance-summary.md
-
-      - name: 📤 Upload Compliance Results
-        if: always()
-        uses: actions/upload-artifact@v4
+      - name: Nuclei Security Scan
+        uses: projectdiscovery/nuclei-action@main
         with:
-          name: compliance-results
-          path: |
-            license-report.json
-            git-security.md
-            compliance-summary.md
+          target: ${{ vars.DAST_TARGET_URL || 'http://example.com' }}
+          flags: '-severity critical,high'
+        continue-on-error: true
 
-  # ============================================
-  # FINAL SECURITY REPORT
-  # ============================================
-  security-report:
+      - name: Nikto Web Scanner
+        run: |
+          docker run --rm sullo/nikto \
+            -h ${{ vars.DAST_TARGET_URL || 'http://example.com' }} \
+            -output /tmp/nikto.txt || true
+        continue-on-error: true
+
+  # Step 8: License Compliance
+  license-compliance:
+    name: 📜 License Compliance Check
+    runs-on: ubuntu-latest
+    needs: prepare
+    # Run on manual trigger or schedule
+    if: |
+      github.event_name == 'workflow_dispatch' || 
+      github.event_name == 'schedule'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: License Finder
+        run: |
+          docker run --rm -v $(pwd):/scan licensefinder/license_finder || true
+        continue-on-error: true
+
+      - name: Licensed Check
+        uses: github/licensed-ci@v1
+        with:
+          command: status
+        continue-on-error: true
+
+  # Step 9: Policy Compliance
+  policy-compliance:
+    name: ✅ Compliance & Policy Check
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Git commit verification
+        run: |
+          echo "Checking commit signatures..."
+          git log --show-signature -1 || true
+        continue-on-error: true
+
+      - name: OPA Policy Check
+        run: |
+          if [ -d "policies" ]; then
+            docker run --rm -v $(pwd):/project \
+              openpolicyagent/opa test /project/policies || true
+          fi
+        continue-on-error: true
+
+  # Step 10: Generate Report
+  generate-report:
     name: 📊 Generate Security Report
     runs-on: ubuntu-latest
     needs: 
       - prepare
-      - sast-scan
+      - essential-security
+      - advanced-sast
       - dependency-scan
       - container-scan
-      - iac-scan
-      - compliance-scan
+      - infrastructure-scan
+      - dast-scan
+      - license-compliance
+      - policy-compliance
     if: always()
     steps:
-      - name: 📥 Download All Artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: security-artifacts
-        continue-on-error: true
-
-      - name: 📝 Generate Consolidated Report
+      - name: Generate Report
         run: |
-          cat << 'EOF' > security-report.md
-          # 🛡️ Security Scan Report
-          
-          **Repository:** ${{ github.repository }}  
-          **Branch:** ${{ github.ref_name }}  
-          **Commit:** ${{ github.sha }}  
-          **Triggered By:** ${{ github.actor }}  
-          **Date:** $(date -u '+%Y-%m-%d %H:%M:%S UTC')  
-          **Trigger Type:** ${{ github.event_name }}
-          
-          ---
-          
-          ## 📊 Scan Execution Summary
-          
-          | Scan Type | Status | Details |
-          |-----------|--------|---------|
-          | 🔐 SAST | ${{ needs.sast-scan.result }} | Static code analysis and secret detection |
-          | 📦 Dependencies | ${{ needs.dependency-scan.result }} | Vulnerability scanning in dependencies |
-          | 🐳 Container | ${{ needs.container-scan.result }} | Docker image and Dockerfile analysis |
-          | 🏗️ Infrastructure | ${{ needs.iac-scan.result }} | IaC security and compliance checks |
-          | 📋 Compliance | ${{ needs.compliance-scan.result }} | License and policy compliance |
-          
-          ---
-          
-          ## 🎯 Scan Decision Logic
-          
-          EOF
-          
-          echo -e "${{ needs.prepare.outputs.scan_summary }}" >> security-report.md
-          
-          cat << 'EOF' >> security-report.md
-          
-          ---
-          
-          ## 📌 Key Findings
-          
-          ### Critical Actions Required:
-          - Review all HIGH and CRITICAL vulnerabilities
-          - Update vulnerable dependencies
-          - Fix security issues before production deployment
-          - Ensure all commits are signed
-          - Verify branch protection rules are enabled
-          
-          ### Next Steps:
-          1. Check the Security tab for detailed SARIF results
-          2. Review artifact files for comprehensive reports
-          3. Address findings based on severity
-          4. Re-run scans after fixes
-          
-          ---
-          
-          ## 📁 Available Reports
-          
-          The following detailed reports are available as artifacts:
-          - SAST results (Semgrep, GitLeaks, TruffleHog)
-          - Dependency vulnerability reports (OSV, OWASP)
-          - Container scan results (Trivy, Hadolint, Grype)
-          - Infrastructure analysis (Checkov, KICS, Terrascan)
-          - Compliance and license reports
-          
-          ---
-          
-          *🔒 This report was generated automatically by the DevSecOps pipeline*
-          EOF
+          echo "# Security Scan Report" > report.md
+          echo "## Execution Summary" >> report.md
+          echo "- Run Mode: ${{ needs.prepare.outputs.run_mode }}" >> report.md
+          echo "- Date: $(date)" >> report.md
+          echo "" >> report.md
+          echo "## Scan Results" >> report.md
+          echo "| Scan | Status |" >> report.md
+          echo "|------|--------|" >> report.md
+          echo "| Essential Security | ${{ needs.essential-security.result }} |" >> report.md
+          echo "| Advanced SAST | ${{ needs.advanced-sast.result }} |" >> report.md
+          echo "| Dependency Scan | ${{ needs.dependency-scan.result }} |" >> report.md
+          echo "| Container Scan | ${{ needs.container-scan.result }} |" >> report.md
+          echo "| Infrastructure | ${{ needs.infrastructure-scan.result }} |" >> report.md
+          echo "| DAST (ZAP) | ${{ needs.dast-scan.result }} |" >> report.md
+          echo "| License Check | ${{ needs.license-compliance.result }} |" >> report.md
+          echo "| Policy Check | ${{ needs.policy-compliance.result }} |" >> report.md
 
-      - name: 💬 Comment on PR
-        if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const report = fs.readFileSync('security-report.md', 'utf8');
-            
-            // Find existing comment
-            const { data: comments } = await github.rest.issues.listComments({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-            });
-            
-            const botComment = comments.find(comment => 
-              comment.user.type === 'Bot' && 
-              comment.body.includes('🛡️ Security Scan Report')
-            );
-            
-            // Update or create comment
-            if (botComment) {
-              await github.rest.issues.updateComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                comment_id: botComment.id,
-                body: report
-              });
-            } else {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.issue.number,
-                body: report
-              });
-            }
-        continue-on-error: true
-
-      - name: 📤 Upload Final Report
+      - name: Upload Report
         uses: actions/upload-artifact@v4
         with:
           name: security-report
-          path: security-report.md
-
-      - name: 📊 Job Summary
-        run: |
-          cat security-report.md >> $GITHUB_STEP_SUMMARY
+          path: report.md

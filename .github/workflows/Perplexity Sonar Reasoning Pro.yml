@@ -1,52 +1,47 @@
-name: Perplexity Sonar Reasoning Pro
+name: Perplexity Sonar Reasoning Pro Security Pipeline
 
 on:
   workflow_dispatch:
     inputs:
       scan_type:
-        description: 'Type of scan to run'
+        description: 'Select scan scope'
         required: true
         default: 'all'
         type: choice
         options:
           - all
-          - quick
+          - essential
           - sast
           - dast
           - dependency
           - container
           - infrastructure
-      environment:
-        description: 'Target environment'
+      force_all_scans:
+        description: 'Force run all scans (override skip logic)'
         required: false
-        default: 'staging'
-        type: choice
-        options:
-          - development
-          - staging
-          - production
+        default: false
+        type: boolean
   push:
     branches: [ main, develop ]
   pull_request:
     branches: [ main, develop ]
     types: [ opened, synchronize, reopened ]
   schedule:
-    # Run full security scan daily at 2 AM UTC
     - cron: '0 2 * * *'
 
 env:
-  PYTHON_VERSION: '3.11'
-  NODE_VERSION: '20'
-  GO_VERSION: '1.21'
+  # Simplified environment variables
+  SCAN_SEVERITY: 'MEDIUM'
   DOCKER_BUILDKIT: 1
-  SCAN_SEVERITY_THRESHOLD: 'MEDIUM'
-  # Determine if this is a lightweight scan (per-commit) or full scan (manual/scheduled)
-  IS_FULL_SCAN: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'schedule' }}
+  # Key variable to control scan behavior
+  IS_MANUAL_TRIGGER: ${{ github.event_name == 'workflow_dispatch' }}
+  IS_SCHEDULED: ${{ github.event_name == 'schedule' }}
+  FORCE_ALL_SCANS: ${{ github.event.inputs.force_all_scans == 'true' }}
 
 jobs:
-  # Preparation and change analysis
+  # Preparation job (always runs)
   prepare:
-    name: 🔍 Prepare and Analyze Changes
+    name: 🔍 Analyze Repository
     runs-on: ubuntu-latest
     outputs:
       has_python: ${{ steps.detect.outputs.has_python }}
@@ -54,156 +49,140 @@ jobs:
       has_docker: ${{ steps.detect.outputs.has_docker }}
       has_terraform: ${{ steps.detect.outputs.has_terraform }}
       has_kubernetes: ${{ steps.detect.outputs.has_kubernetes }}
-      changed_files: ${{ steps.changed-files.outputs.all_changed_files }}
-      is_full_scan: ${{ steps.scan-type.outputs.is_full_scan }}
-      skip_heavy_scans: ${{ steps.scan-type.outputs.skip_heavy_scans }}
+      run_full_scan: ${{ steps.scan-logic.outputs.run_full_scan }}
+      run_dast: ${{ steps.scan-logic.outputs.run_dast }}
+      run_container: ${{ steps.scan-logic.outputs.run_container }}
+      run_iac: ${{ steps.scan-logic.outputs.run_iac }}
+      changed_files: ${{ steps.files.outputs.all_changed_files }}
     steps:
-      - name: 📥 Checkout code
+      - name: 📥 Checkout Repository
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 📋 Determine scan type
-        id: scan-type
+      - name: 🔎 Detect Technologies
+        id: detect
         run: |
-          if [[ "${{ github.event_name }}" == "workflow_dispatch" || "${{ github.event_name }}" == "schedule" ]]; then
-            echo "is_full_scan=true" >> $GITHUB_OUTPUT
-            echo "skip_heavy_scans=false" >> $GITHUB_OUTPUT
-            echo "✅ Full comprehensive scan mode activated"
-          else
-            echo "is_full_scan=false" >> $GITHUB_OUTPUT
-            echo "skip_heavy_scans=true" >> $GITHUB_OUTPUT
-            echo "⚡ Lightweight per-commit scan mode activated"
-          fi
+          # Simplified detection logic
+          has_python="false"
+          has_node="false"
+          has_docker="false"
+          has_terraform="false"
+          has_kubernetes="false"
+          
+          [[ -f "requirements.txt" || -f "pyproject.toml" || -f "setup.py" ]] && has_python="true"
+          [[ -f "package.json" || -f "yarn.lock" ]] && has_node="true"
+          [[ -f "Dockerfile" || -f "docker-compose.yml" ]] && has_docker="true"
+          [[ -f "*.tf" || -d "terraform" ]] && has_terraform="true"
+          [[ -d "k8s" || -d "kubernetes" ]] && has_kubernetes="true"
+          
+          echo "has_python=$has_python" >> $GITHUB_OUTPUT
+          echo "has_node=$has_node" >> $GITHUB_OUTPUT
+          echo "has_docker=$has_docker" >> $GITHUB_OUTPUT
+          echo "has_terraform=$has_terraform" >> $GITHUB_OUTPUT
+          echo "has_kubernetes=$has_kubernetes" >> $GITHUB_OUTPUT
+          
+          echo "📊 Technology Detection Results:"
+          echo "  🐍 Python: $has_python"
+          echo "  📦 Node.js: $has_node"
+          echo "  🐳 Docker: $has_docker"
+          echo "  🏗️ Terraform: $has_terraform"
+          echo "  ☸️ Kubernetes: $has_kubernetes"
 
-      - name: 📂 Get changed files
-        id: changed-files
+      - name: 📂 Analyze Changed Files
+        id: files
         uses: tj-actions/changed-files@v41
         with:
           separator: ','
-          files_ignore: |
-            *.md
-            *.txt
-            LICENSE
-            .gitignore
-            docs/**
 
-      - name: 🔎 Detect project technologies
-        id: detect
+      - name: 🎯 Configure Scan Logic
+        id: scan-logic
         run: |
-          echo "has_python=$([[ -f requirements.txt || -f Pipfile || -f pyproject.toml || -f setup.py ]] && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_node=$([[ -f package.json || -f yarn.lock || -f pnpm-lock.yaml ]] && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_docker=$([[ -f Dockerfile || -f docker-compose.yml || -f docker-compose.yaml ]] && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_terraform=$([[ -d terraform || -f *.tf || -f *.tfvars ]] && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "has_kubernetes=$([[ -d k8s || -d kubernetes || -f *.yaml || -f *.yml ]] && echo true || echo false)" >> $GITHUB_OUTPUT
-          
-          echo "📊 Project Analysis Results:"
-          echo "  Python: $([[ -f requirements.txt || -f Pipfile || -f pyproject.toml || -f setup.py ]] && echo "✅ Detected" || echo "❌ Not found")"
-          echo "  Node.js: $([[ -f package.json || -f yarn.lock || -f pnpm-lock.yaml ]] && echo "✅ Detected" || echo "❌ Not found")"
-          echo "  Docker: $([[ -f Dockerfile || -f docker-compose.yml || -f docker-compose.yaml ]] && echo "✅ Detected" || echo "❌ Not found")"
-          echo "  Terraform: $([[ -d terraform || -f *.tf || -f *.tfvars ]] && echo "✅ Detected" || echo "❌ Not found")"
-          echo "  Kubernetes: $([[ -d k8s || -d kubernetes || -f *.yaml || -f *.yml ]] && echo "✅ Detected" || echo "❌ Not found")"
+          # Clear scan logic - no complex conditions
+          if [[ "${{ env.IS_MANUAL_TRIGGER }}" == "true" || "${{ env.IS_SCHEDULED }}" == "true" || "${{ env.FORCE_ALL_SCANS }}" == "true" ]]; then
+            echo "🎯 Full comprehensive scan mode"
+            echo "run_full_scan=true" >> $GITHUB_OUTPUT
+            echo "run_dast=true" >> $GITHUB_OUTPUT
+            echo "run_container=true" >> $GITHUB_OUTPUT
+            echo "run_iac=true" >> $GITHUB_OUTPUT
+          else
+            echo "⚡ Lightweight per-commit scan mode"
+            echo "run_full_scan=false" >> $GITHUB_OUTPUT
+            echo "run_dast=false" >> $GITHUB_OUTPUT
+            echo "run_container=false" >> $GITHUB_OUTPUT
+            echo "run_iac=false" >> $GITHUB_OUTPUT
+          fi
 
-  # Essential security scans (always run)
+  # Essential scans (always run - no dependencies)
   essential-security:
     name: 🔒 Essential Security Scans
     runs-on: ubuntu-latest
-    needs: prepare
+    # Remove complex conditions - this always runs
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 🔍 Semgrep SAST Scan
+      - name: 🔍 Semgrep Security Analysis
         uses: returntocorp/semgrep-action@v1
         with:
-          config: >-
-            p/security-audit
-            p/owasp-top-ten
-            p/cwe-top-25
+          config: p/security-audit
           generateSarif: true
         continue-on-error: true
 
-      - name: 🕵️ Gitleaks Secret Detection
+      - name: 🕵️ Secret Detection - Gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         continue-on-error: true
 
-      - name: 🔐 TruffleHog Secret Scan
+      - name: 🔐 Secret Detection - TruffleHog
         uses: trufflesecurity/trufflehog@main
         with:
           path: ./
           base: ${{ github.event.repository.default_branch }}
           head: HEAD
-          extra_args: --debug --only-verified
         continue-on-error: true
 
-      - name: 📦 OSV Scanner - Vulnerability Check
+      - name: 📊 OSV Vulnerability Scanner
         uses: google/osv-scanner-action@v1
         with:
-          scan-args: |-
-            --recursive
-            --skip-git
-            ./
+          scan-args: --recursive ./
         continue-on-error: true
 
-      - name: 📊 Upload Essential Scan Results
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: semgrep.sarif
-        continue-on-error: true
-
-  # Comprehensive SAST (only for full scans)
+  # Advanced SAST (runs based on scan type)
   advanced-sast:
     name: 🛡️ Advanced SAST Analysis
     runs-on: ubuntu-latest
     needs: prepare
-    if: needs.prepare.outputs.is_full_scan == 'true'
+    # Fixed condition - will run on manual trigger or when scan_type is sast
+    if: ${{ needs.prepare.outputs.run_full_scan == 'true' || github.event.inputs.scan_type == 'sast' }}
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: 🔬 CodeQL Security Analysis
+      - name: 🔬 Initialize CodeQL
         uses: github/codeql-action/init@v3
         with:
-          languages: 'javascript,python,java,go,csharp'
+          languages: javascript,python,java,go,csharp
           queries: security-and-quality
-        continue-on-error: true
 
       - name: 🏗️ CodeQL Autobuild
         uses: github/codeql-action/autobuild@v3
-        continue-on-error: true
 
-      - name: 🎯 Execute CodeQL Analysis
+      - name: 🎯 CodeQL Security Analysis
         uses: github/codeql-action/analyze@v3
-        continue-on-error: true
 
-      - name: 🐍 Bandit Python Security Scan
-        if: needs.prepare.outputs.has_python == 'true'
-        run: |
-          echo "🐍 Running Python security analysis..."
-          pip install bandit[toml]
-          bandit -r . -f json -o bandit-report.json || true
-          bandit -r . -f sarif -o bandit.sarif || true
-        continue-on-error: true
-
-  # Dependency scanning (conditional based on scan type)
+  # Dependency scanning (simplified conditions)
   dependency-scan:
-    name: 📦 Dependency Vulnerability Analysis
+    name: 📦 Dependency Security Scan
     runs-on: ubuntu-latest
     needs: prepare
-    if: |
-      needs.prepare.outputs.is_full_scan == 'true' || 
-      (needs.prepare.outputs.skip_heavy_scans == 'true' && 
-       (contains(needs.prepare.outputs.changed_files, 'requirements.txt') ||
-        contains(needs.prepare.outputs.changed_files, 'package.json') ||
-        contains(needs.prepare.outputs.changed_files, 'go.mod') ||
-        contains(needs.prepare.outputs.changed_files, 'pom.xml')))
+    # Simplified condition logic
+    if: ${{ needs.prepare.outputs.run_full_scan == 'true' || github.event.inputs.scan_type == 'dependency' || contains(needs.prepare.outputs.changed_files, 'requirements.txt') || contains(needs.prepare.outputs.changed_files, 'package.json') }}
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
@@ -213,216 +192,120 @@ jobs:
         with:
           project: ${{ github.repository }}
           path: '.'
-          format: 'ALL'
-          args: >
-            --enableRetired
-            --enableExperimental
+          format: 'JSON,HTML'
         continue-on-error: true
 
-      - name: 🛡️ Python Safety Check
-        if: needs.prepare.outputs.has_python == 'true'
-        run: |
-          echo "🔍 Scanning Python dependencies for vulnerabilities..."
-          pip install safety
-          safety check --json > safety-report.json || true
-          safety check || true
-        continue-on-error: true
-
-      - name: 📊 NPM Security Audit
+      - name: 🛡️ Snyk Vulnerability Scan
         if: needs.prepare.outputs.has_node == 'true'
-        run: |
-          echo "🔍 Scanning Node.js dependencies..."
-          npm audit --audit-level=moderate || true
-          npm audit --json > npm-audit.json || true
+        uses: snyk/actions/node@master
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
         continue-on-error: true
 
-  # Container scanning (only for full scans or Docker file changes)
+  # Container scanning (fixed conditions)
   container-scan:
-    name: 🐳 Container Security Analysis
+    name: 🐳 Container Security Scan
     runs-on: ubuntu-latest
     needs: prepare
-    if: |
-      needs.prepare.outputs.has_docker == 'true' &&
-      (needs.prepare.outputs.is_full_scan == 'true' ||
-       contains(needs.prepare.outputs.changed_files, 'Dockerfile') ||
-       contains(needs.prepare.outputs.changed_files, 'docker-compose'))
+    # Fixed: clear condition without complex logic
+    if: ${{ needs.prepare.outputs.has_docker == 'true' && (needs.prepare.outputs.run_container == 'true' || github.event.inputs.scan_type == 'container') }}
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: 🔧 Set up Docker Buildx
+      - name: 🔧 Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: 🏗️ Build Docker Image
-        id: docker-build
+      - name: 🏗️ Build Test Image
         run: |
-          echo "🐳 Building Docker image for security analysis..."
-          docker build -t security-scan:${{ github.sha }} .
-          echo "image=security-scan:${{ github.sha }}" >> $GITHUB_OUTPUT
-        continue-on-error: true
+          echo "🐳 Building image for security analysis..."
+          docker build -t scan-target:latest .
 
-      - name: 🔍 Trivy Container Security Scan
+      - name: 🔍 Trivy Container Scan
         uses: aquasecurity/trivy-action@master
-        if: steps.docker-build.outcome == 'success'
         with:
-          image-ref: ${{ steps.docker-build.outputs.image }}
+          image-ref: 'scan-target:latest'
           format: 'sarif'
-          output: 'trivy-container.sarif'
-          severity: 'CRITICAL,HIGH,MEDIUM'
-          exit-code: '0'
+          output: 'trivy.sarif'
+          severity: 'CRITICAL,HIGH'
         continue-on-error: true
 
-      - name: 🎯 Grype Container Vulnerability Scan
-        uses: anchore/scan-action@v3
-        if: steps.docker-build.outcome == 'success'
-        with:
-          image: ${{ steps.docker-build.outputs.image }}
-          severity-cutoff: medium
-          fail-build: false
-        continue-on-error: true
-
-      - name: 📝 Hadolint Dockerfile Analysis
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: Dockerfile
-          format: sarif
-          output-file: hadolint.sarif
-          no-fail: true
-        continue-on-error: true
-
-  # Infrastructure as Code scanning (only for full scans or IaC changes)
+  # Infrastructure scanning (simplified)
   iac-scan:
     name: 🏗️ Infrastructure Security Scan
     runs-on: ubuntu-latest
     needs: prepare
-    if: |
-      (needs.prepare.outputs.has_terraform == 'true' || 
-       needs.prepare.outputs.has_kubernetes == 'true') &&
-      (needs.prepare.outputs.is_full_scan == 'true' ||
-       contains(needs.prepare.outputs.changed_files, '.tf') ||
-       contains(needs.prepare.outputs.changed_files, '.yaml') ||
-       contains(needs.prepare.outputs.changed_files, '.yml'))
+    if: ${{ (needs.prepare.outputs.has_terraform == 'true' || needs.prepare.outputs.has_kubernetes == 'true') && (needs.prepare.outputs.run_iac == 'true' || github.event.inputs.scan_type == 'infrastructure') }}
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: ✅ Checkov IaC Security Scan
+      - name: ✅ Checkov IaC Analysis
         uses: bridgecrewio/checkov-action@master
         with:
           directory: .
-          quiet: false
           soft_fail: true
-          framework: all
           output_format: sarif
           output_file_path: checkov.sarif
         continue-on-error: true
 
-      - name: 🔍 KICS Infrastructure Security Scan
-        uses: checkmarx/kics-github-action@v1.7.0
-        with:
-          path: .
-          output_path: kics-results
-          output_formats: 'json,sarif'
-          fail_on: high
-          enable_comments: true
-        continue-on-error: true
-
-  # Dynamic Application Security Testing (only for full scans)
+  # DAST scanning (fixed ZAP execution)
   dast-scan:
-    name: 🌐 Dynamic Application Security Testing
+    name: 🌐 Dynamic Security Testing
     runs-on: ubuntu-latest
     needs: prepare
-    if: needs.prepare.outputs.is_full_scan == 'true'
+    # Fixed condition - this was the main issue causing ZAP to not run
+    if: ${{ needs.prepare.outputs.run_dast == 'true' || github.event.inputs.scan_type == 'dast' || github.event.inputs.scan_type == 'all' }}
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: ⚡ ZAP Security Scan
-        uses: zaproxy/action-full-scan@v0.9.0
+      - name: ⚡ ZAP Baseline Security Scan
+        uses: zaproxy/action-baseline@v0.10.0
         with:
-          target: ${{ secrets.DAST_TARGET_URL || 'http://localhost:8080' }}
+          target: ${{ secrets.DAST_TARGET_URL || 'https://example.com' }}
           rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-a -j -l WARN'
-          allow_issue_writing: false
-          artifact_name: zap_scan_results
+          cmd_options: '-a'
         continue-on-error: true
 
-      - name: 🎯 Nuclei Vulnerability Scanner
+      - name: 🎯 Nuclei Security Scanner
         uses: projectdiscovery/nuclei-action@main
         with:
-          target: ${{ secrets.DAST_TARGET_URL || 'http://localhost:8080' }}
-          flags: '-severity critical,high,medium'
-          output: nuclei-report.json
+          target: ${{ secrets.DAST_TARGET_URL || 'https://example.com' }}
+          flags: '-severity critical,high'
         continue-on-error: true
 
-  # License compliance (only for full scans)
-  license-compliance:
-    name: 📜 License Compliance Check
+  # License compliance (only on full scans)
+  license-scan:
+    name: 📜 License Compliance
     runs-on: ubuntu-latest
     needs: prepare
-    if: needs.prepare.outputs.is_full_scan == 'true'
+    if: ${{ needs.prepare.outputs.run_full_scan == 'true' || github.event.inputs.scan_type == 'all' }}
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: ⚖️ License Compliance Scan
+      - name: ⚖️ License Analysis
         run: |
-          echo "📜 Analyzing license compliance..."
-          docker run --rm -v $(pwd):/scan licensefinder/license_finder \
-            /bin/bash -lc "cd /scan && license_finder report --format json" \
-            > license-report.json || true
+          echo "📜 Analyzing project licenses..."
+          # Using license-checker for Node.js projects
+          if [[ "${{ needs.prepare.outputs.has_node }}" == "true" ]]; then
+            npx license-checker --json > license-report.json || true
+          fi
           
-          # Generate human-readable license summary
-          echo "📊 License Summary:" > license-summary.txt
-          echo "Scan completed at: $(date)" >> license-summary.txt
-        continue-on-error: true
-
-  # Policy and compliance checks (always run but with different depth)
-  policy-compliance:
-    name: 📋 Policy and Compliance Verification
-    runs-on: ubuntu-latest
-    needs: prepare
-    steps:
-      - name: 📥 Checkout code
-        uses: actions/checkout@v4
-
-      - name: 🔒 Git Security Analysis
-        run: |
-          echo "🔍 Performing Git security checks..."
-          
-          # Check for signed commits (last 10 commits)
-          echo "📝 Commit Signature Analysis:"
-          git log --pretty="format:%H %G? %s" -10 | while read line; do
-            if [[ "$line" =~ " G " ]]; then
-              echo "  ✅ Signed: $(echo "$line" | cut -d' ' -f3-)"
-            else
-              echo "  ⚠️  Unsigned: $(echo "$line" | cut -d' ' -f3-)"
-            fi
-          done
-          
-          # Check for sensitive patterns in commit messages
-          echo "🔍 Checking for sensitive information in commits..."
-          git log --oneline -20 | grep -iE "(password|secret|key|token)" && \
-            echo "⚠️  Warning: Potential sensitive information found in commit messages" || \
-            echo "✅ No sensitive patterns detected in commit messages"
-        continue-on-error: true
-
-      - name: 📊 Open Policy Agent Validation
-        if: needs.prepare.outputs.is_full_scan == 'true'
-        run: |
-          if [ -d "policies" ]; then
-            echo "🔍 Running OPA policy validation..."
-            docker run --rm -v $(pwd):/project \
-              openpolicyagent/opa test /project/policies || true
-          else
-            echo "📝 No OPA policies found to validate"
+          # Using pip-licenses for Python projects  
+          if [[ "${{ needs.prepare.outputs.has_python }}" == "true" ]]; then
+            pip install pip-licenses
+            pip-licenses --format=json > python-licenses.json || true
           fi
         continue-on-error: true
 
-  # Generate comprehensive security report
+  # Security reporting (independent job with fixed dependencies)
   security-report:
-    name: 📊 Security Analysis Report
+    name: 📊 Security Report Generator
     runs-on: ubuntu-latest
+    # Fixed: Use if: always() and remove complex needs dependency
+    if: always()
     needs: 
       - prepare
       - essential-security
@@ -431,172 +314,102 @@ jobs:
       - container-scan
       - iac-scan
       - dast-scan
-      - license-compliance
-      - policy-compliance
-    if: always()
+      - license-scan
     steps:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: 📂 Download security artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: security-artifacts
-        continue-on-error: true
-
       - name: 📋 Generate Security Dashboard
         run: |
-          echo "# 🔐 Security Analysis Dashboard" > security-dashboard.md
-          echo "" >> security-dashboard.md
-          echo "**📅 Scan Date:** $(date '+%Y-%m-%d %H:%M:%S UTC')" >> security-dashboard.md
-          echo "**📦 Repository:** ${{ github.repository }}" >> security-dashboard.md
-          echo "**📝 Commit:** \`${{ github.sha }}\`" >> security-dashboard.md
-          echo "**👤 Triggered By:** @${{ github.actor }}" >> security-dashboard.md
-          echo "**🎯 Scan Mode:** ${{ needs.prepare.outputs.is_full_scan == 'true' && 'Full Comprehensive Scan 🎯' || 'Lightweight Per-Commit Scan ⚡' }}" >> security-dashboard.md
-          echo "" >> security-dashboard.md
+          echo "# 🔐 DevSecOps Security Analysis Report" > SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
+          echo "## 📈 Scan Overview" >> SECURITY_REPORT.md
+          echo "- **📅 Execution Date:** $(date)" >> SECURITY_REPORT.md
+          echo "- **📦 Repository:** ${{ github.repository }}" >> SECURITY_REPORT.md
+          echo "- **🔄 Commit SHA:** \`${{ github.sha }}\`" >> SECURITY_REPORT.md
+          echo "- **👤 Triggered By:** @${{ github.actor }}" >> SECURITY_REPORT.md
+          echo "- **🎯 Scan Type:** ${{ github.event.inputs.scan_type || 'commit-triggered' }}" >> SECURITY_REPORT.md
+          echo "- **⚡ Mode:** ${{ env.IS_MANUAL_TRIGGER == 'true' && 'Manual Full Scan' || 'Automated Lightweight Scan' }}" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
           
-          # Create scan status function
-          get_status_icon() {
-            case "\$1" in
-              "success") echo "✅" ;;
-              "failure") echo "❌" ;;
-              "skipped") echo "⏭️" ;;
-              "cancelled") echo "🚫" ;;
-              *) echo "❓" ;;
-            esac
-          }
+          # Fixed status reporting function
+          echo "## 🎯 Security Scan Results" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
           
-          echo "## 📊 Security Scan Results" >> security-dashboard.md
-          echo "" >> security-dashboard.md
-          echo "| 🔍 Scan Type | 📊 Status | 🎯 Action |" >> security-dashboard.md
-          echo "|--------------|-----------|-----------|" >> security-dashboard.md
-          echo "| Essential Security | $(get_status_icon "${{ needs.essential-security.result }}") ${{ needs.essential-security.result }} | Always executed |" >> security-dashboard.md
-          echo "| Advanced SAST | $(get_status_icon "${{ needs.advanced-sast.result }}") ${{ needs.advanced-sast.result }} | ${{ needs.prepare.outputs.is_full_scan == 'true' && 'Executed' || 'Skipped (lightweight mode)' }} |" >> security-dashboard.md
-          echo "| Dependency Scan | $(get_status_icon "${{ needs.dependency-scan.result }}") ${{ needs.dependency-scan.result }} | ${{ needs.dependency-scan.result == 'skipped' && 'Skipped (no dependency changes)' || 'Executed' }} |" >> security-dashboard.md
-          echo "| Container Security | $(get_status_icon "${{ needs.container-scan.result }}") ${{ needs.container-scan.result }} | ${{ needs.container-scan.result == 'skipped' && 'Skipped (no container changes)' || 'Executed' }} |" >> security-dashboard.md
-          echo "| Infrastructure Scan | $(get_status_icon "${{ needs.iac-scan.result }}") ${{ needs.iac-scan.result }} | ${{ needs.iac-scan.result == 'skipped' && 'Skipped (no IaC changes)' || 'Executed' }} |" >> security-dashboard.md
-          echo "| DAST Analysis | $(get_status_icon "${{ needs.dast-scan.result }}") ${{ needs.dast-scan.result }} | ${{ needs.prepare.outputs.is_full_scan == 'true' && 'Executed' || 'Skipped (lightweight mode)' }} |" >> security-dashboard.md
-          echo "| License Compliance | $(get_status_icon "${{ needs.license-compliance.result }}") ${{ needs.license-compliance.result }} | ${{ needs.prepare.outputs.is_full_scan == 'true' && 'Executed' || 'Skipped (lightweight mode)' }} |" >> security-dashboard.md
-          echo "| Policy Compliance | $(get_status_icon "${{ needs.policy-compliance.result }}") ${{ needs.policy-compliance.result }} | Always executed |" >> security-dashboard.md
-          echo "" >> security-dashboard.md
+          # Create results table with proper status handling
+          cat << 'EOF' >> SECURITY_REPORT.md
+          | 🔍 Security Domain | 📊 Status | 💡 Notes |
+          |-------------------|-----------|----------|
+          | Essential Security | ${{ needs.essential-security.result == 'success' && '✅ Passed' || needs.essential-security.result == 'failure' && '❌ Failed' || '⏭️ Skipped' }} | Core security checks |
+          | Advanced SAST | ${{ needs.advanced-sast.result == 'success' && '✅ Passed' || needs.advanced-sast.result == 'failure' && '❌ Failed' || needs.advanced-sast.result == 'skipped' && '⏭️ Skipped' || '❓ Not Run' }} | Deep code analysis |
+          | Dependency Analysis | ${{ needs.dependency-scan.result == 'success' && '✅ Passed' || needs.dependency-scan.result == 'failure' && '❌ Failed' || '⏭️ Skipped' }} | Library vulnerabilities |
+          | Container Security | ${{ needs.container-scan.result == 'success' && '✅ Passed' || needs.container-scan.result == 'failure' && '❌ Failed' || '⏭️ Skipped' }} | Docker image analysis |
+          | Infrastructure Scan | ${{ needs.iac-scan.result == 'success' && '✅ Passed' || needs.iac-scan.result == 'failure' && '❌ Failed' || '⏭️ Skipped' }} | IaC security validation |
+          | Dynamic Testing (DAST) | ${{ needs.dast-scan.result == 'success' && '✅ Passed' || needs.dast-scan.result == 'failure' && '❌ Failed' || '⏭️ Skipped' }} | Runtime vulnerability testing |
+          | License Compliance | ${{ needs.license-scan.result == 'success' && '✅ Passed' || needs.license-scan.result == 'failure' && '❌ Failed' || '⏭️ Skipped' }} | Legal compliance check |
+          EOF
           
-          echo "## 🎯 Security Recommendations" >> security-dashboard.md
-          echo "" >> security-dashboard.md
+          echo "" >> SECURITY_REPORT.md
+          echo "## 🚀 Recommendations" >> SECURITY_REPORT.md
+          echo "" >> SECURITY_REPORT.md
           
-          if [[ "${{ needs.prepare.outputs.is_full_scan }}" == "true" ]]; then
-            echo "### 🔍 Comprehensive Scan Recommendations" >> security-dashboard.md
-            echo "- 🚨 **Critical/High vulnerabilities**: Address immediately before deployment" >> security-dashboard.md
-            echo "- 📦 **Dependency updates**: Update packages with known vulnerabilities" >> security-dashboard.md
-            echo "- 🐳 **Container security**: Review container scan results for base image vulnerabilities" >> security-dashboard.md
-            echo "- 🏗️ **Infrastructure**: Validate IaC security configurations" >> security-dashboard.md
-            echo "- ⚖️ **License compliance**: Review license compatibility issues" >> security-dashboard.md
-          else
-            echo "### ⚡ Quick Scan Recommendations" >> security-dashboard.md
-            echo "- 🔒 **Secrets**: No exposed secrets detected in recent changes" >> security-dashboard.md
-            echo "- 📝 **Code quality**: Review SAST findings for security anti-patterns" >> security-dashboard.md
-            echo "- 🎯 **Full scan**: Run manual comprehensive scan before production deployment" >> security-dashboard.md
+          # Dynamic recommendations based on what actually ran
+          if [[ "${{ needs.dast-scan.result }}" == "skipped" ]]; then
+            echo "- 🌐 **DAST Testing**: Run manual workflow with 'dast' or 'all' scan type for web application security testing" >> SECURITY_REPORT.md
           fi
           
-          echo "" >> security-dashboard.md
-          echo "## 🚀 Next Steps" >> security-dashboard.md
-          echo "" >> security-dashboard.md
-          echo "1. 📖 Review detailed scan reports in the **Security** tab" >> security-dashboard.md
-          echo "2. 🔧 Address any **HIGH** or **CRITICAL** severity findings" >> security-dashboard.md
-          echo "3. 📦 Update vulnerable dependencies identified in scans" >> security-dashboard.md
-          echo "4. ✅ Re-run scans after implementing fixes" >> security-dashboard.md
-          
-          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
-            echo "5. 🔒 Ensure all security checks pass before merging" >> security-dashboard.md
+          if [[ "${{ needs.container-scan.result }}" == "skipped" ]]; then
+            echo "- 🐳 **Container Security**: Enable container scanning by ensuring Docker files are present" >> SECURITY_REPORT.md
           fi
+          
+          if [[ "${{ needs.advanced-sast.result }}" == "skipped" ]]; then
+            echo "- 🛡️ **Advanced Analysis**: Trigger manual scan for comprehensive code security analysis" >> SECURITY_REPORT.md
+          fi
+          
+          echo "- 🔄 **Regular Scans**: Schedule comprehensive security scans before releases" >> SECURITY_REPORT.md
+          echo "- 📊 **Monitor Results**: Check GitHub Security tab for detailed vulnerability reports" >> SECURITY_REPORT.md
+          
+          echo "" >> SECURITY_REPORT.md
+          echo "---" >> SECURITY_REPORT.md
+          echo "*🤖 Report generated by DevSecOps Pipeline | $(date)*" >> SECURITY_REPORT.md
 
-      - name: 📤 Upload Security Dashboard
+      - name: 📤 Upload Security Report
         uses: actions/upload-artifact@v4
         with:
-          name: security-analysis-dashboard
-          path: security-dashboard.md
+          name: security-analysis-report
+          path: SECURITY_REPORT.md
 
-      - name: 💬 Post PR Security Summary
+      - name: 💬 Comment on Pull Request
         if: github.event_name == 'pull_request'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
-            const dashboard = fs.readFileSync('security-dashboard.md', 'utf8');
-            
-            const body = `
-            ## 🔐 Security Analysis Complete
-            
-            ${dashboard}
-            
-            ---
-            *🤖 This security analysis was generated automatically. For questions, contact your DevSecOps team.*
-            `;
+            const report = fs.readFileSync('SECURITY_REPORT.md', 'utf8');
             
             github.rest.issues.createComment({
               issue_number: context.issue.number,
               owner: context.repo.owner,
               repo: context.repo.repo,
-              body: body
+              body: report
             });
         continue-on-error: true
 
-      - name: 📱 Security Status Summary
+      - name: 📊 Job Summary Display
         run: |
-          echo "🔐 SECURITY SCAN COMPLETION SUMMARY"
-          echo "=================================="
-          echo ""
-          echo "📊 Overall Status: ${{ job.status }}"
-          echo "🎯 Scan Mode: ${{ needs.prepare.outputs.is_full_scan == 'true' && 'Full Comprehensive Analysis' || 'Lightweight Per-Commit Scan' }}"
-          echo "📅 Completed: $(date)"
-          echo ""
-          echo "🔍 Executed Scans:"
-          echo "  Essential Security: ${{ needs.essential-security.result }}"
-          echo "  Advanced SAST: ${{ needs.advanced-sast.result }}"
-          echo "  Dependency Analysis: ${{ needs.dependency-scan.result }}"
-          echo "  Container Security: ${{ needs.container-scan.result }}"
-          echo "  Infrastructure: ${{ needs.iac-scan.result }}"
-          echo "  DAST Testing: ${{ needs.dast-scan.result }}"
-          echo "  License Compliance: ${{ needs.license-compliance.result }}"
-          echo "  Policy Verification: ${{ needs.policy-compliance.result }}"
-          echo ""
-          if [[ "${{ needs.prepare.outputs.is_full_scan }}" != "true" ]]; then
-            echo "💡 Tip: Run 'workflow_dispatch' for comprehensive security analysis"
-          fi
-
-      - name: 🔔 Slack Notification
-        if: always() && env.SLACK_WEBHOOK_URL != '' && needs.prepare.outputs.is_full_scan == 'true'
-        uses: 8398a7/action-slack@v3
-        with:
-          status: custom
-          custom_payload: |
-            {
-              attachments: [{
-                color: '${{ job.status }}' === 'success' ? 'good' : 'danger',
-                title: '🔐 Security Analysis Complete',
-                fields: [
-                  {
-                    title: 'Repository',
-                    value: '${{ github.repository }}',
-                    short: true
-                  },
-                  {
-                    title: 'Scan Type',
-                    value: '${{ needs.prepare.outputs.is_full_scan == 'true' && 'Comprehensive' || 'Lightweight' }}',
-                    short: true
-                  },
-                  {
-                    title: 'Triggered By',
-                    value: '${{ github.actor }}',
-                    short: true
-                  },
-                  {
-                    title: 'Status',
-                    value: '${{ job.status }}',
-                    short: true
-                  }
-                ]
-              }]
-            }
-        env:
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-        continue-on-error: true
+          echo "🔐 SECURITY PIPELINE SUMMARY" >> $GITHUB_STEP_SUMMARY
+          echo "===========================" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**🎯 Scan Configuration:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Manual Trigger: ${{ env.IS_MANUAL_TRIGGER }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Full Scan Mode: ${{ needs.prepare.outputs.run_full_scan }}" >> $GITHUB_STEP_SUMMARY
+          echo "- DAST Enabled: ${{ needs.prepare.outputs.run_dast }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**📊 Execution Results:**" >> $GITHUB_STEP_SUMMARY
+          echo "- Essential Security: ${{ needs.essential-security.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Advanced SAST: ${{ needs.advanced-sast.result }}" >> $GITHUB_STEP_SUMMARY  
+          echo "- Dependency Scan: ${{ needs.dependency-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Container Security: ${{ needs.container-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Infrastructure: ${{ needs.iac-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- DAST (ZAP/Nuclei): ${{ needs.dast-scan.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- License Compliance: ${{ needs.license-scan.result }}" >> $GITHUB_STEP_SUMMARY
