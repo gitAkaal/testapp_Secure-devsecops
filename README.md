@@ -29,19 +29,38 @@ The applications demonstrate various OWASP Top 10 vulnerabilities including:
 This project uses GitHub Actions to automatically run security scans on code changes:
 
 ### SAST Tools
-- **Bearer**: Scans Java files for security issues
-- **Bandit**: Analyzes Python code for security vulnerabilities
-- **Trivy**: Performs comprehensive vulnerability scanning
+- **Bandit**: Python-specific security scanner for detecting common security issues
+- **OWASP Dependency Check**: Identifies known vulnerabilities in project dependencies
+- **Trivy**: Multi-purpose security scanner for:
+  - File system scanning
+  - Container image vulnerabilities
+  - Infrastructure as Code (IaC) issues
+  - Secret detection
 
 ### DAST Tools
-- **OWASP ZAP**: Performs dynamic security testing on the running application
+- **OWASP ZAP**: Performs dynamic security testing on running applications
+  - Automated vulnerability scanning
+  - API security testing
+  - Configurable alert filtering
+
+### Container Security
+- Docker image scanning with Trivy
+- Software Bill of Materials (SBOM) generation
+- Container configuration assessment
+- Multi-stage build security
 
 ## Workflow Features
 
 - Runs automatically on push to main and pull requests
-- Scans only changed files for efficiency
+- Manual trigger support with customizable options:
+  - Scan type selection (SAST/DAST/All)
+  - Severity level filtering
+  - Target path specification
+- Intelligent file change detection
 - Parallel execution of security tools
-- Detailed scan reports for each tool
+- Comprehensive scan reports and artifacts
+- GitHub Container Registry integration
+- Secure variable handling and sanitization
 
 ## Usage
 

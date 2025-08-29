@@ -2,22 +2,35 @@
 
 This document explains the GitHub Actions workflow defined in `security-scan.yml` which performs comprehensive security scanning including SAST (Static Application Security Testing) and DAST (Dynamic Application Security Testing).
 
+## Overview
+
+The workflow provides end-to-end security scanning capabilities:
+1. Static Analysis (SAST)
+   - Python code scanning with Bandit
+   - Dependency vulnerability checking with OWASP Dependency Check
+   - Container and filesystem scanning with Trivy
+2. Dynamic Analysis (DAST)
+   - Web application scanning with OWASP ZAP
+3. Container Security
+   - Image vulnerability scanning
+   - Configuration assessment
+   - SBOM generation
+
 ## Workflow Triggers
 
 ```yaml
 on:
   push:
     branches: [ main ]
-    paths:
-      - '**.py'    # Python files
-      - '**.java'  # Java files
-      - 'Dockerfile'
-      - '**/requirements.txt'
-      - 'pom.xml'
   pull_request:
     branches: [ main ]
   workflow_dispatch:  # Manual trigger
 ```
+
+The workflow runs on:
+- Any push to the main branch
+- Any pull request targeting main branch
+- Manual trigger via GitHub Actions UI
 
 - Automatically triggers on pushes to `main` branch when relevant files change
 - Runs on pull requests targeting `main` branch
@@ -25,7 +38,7 @@ on:
 
 ### Manual Trigger Options
 
-The workflow supports the following input parameters when triggered manually:
+When triggering the workflow manually, you can customize the scan with these parameters:
 
 1. **scan_type** (required):
    - `all`: Run both SAST and DAST scans
@@ -33,21 +46,90 @@ The workflow supports the following input parameters when triggered manually:
    - `dast`: Run only dynamic analysis
 
 2. **severity_level** (optional):
-   - `HIGH,CRITICAL` (default)
-   - `CRITICAL`
-   - `HIGH`
-   - `MEDIUM,HIGH,CRITICAL`
-   - `LOW,MEDIUM,HIGH,CRITICAL`
+   - `HIGH,CRITICAL` (default): Only high and critical issues
+   - `CRITICAL`: Only critical issues
+   - `HIGH`: Only high severity issues
+   - `MEDIUM,HIGH,CRITICAL`: Medium and above
+   - `LOW,MEDIUM,HIGH,CRITICAL`: All severity levels
 
 3. **target_path** (optional):
    - Specific path to scan
-   - Defaults to entire repository
+   - Defaults to entire repository ('.')
 
-## Jobs Description
+## Jobs and Their Functions
 
-### 1. Get Changed Files (`get-changed-files`)
+### 1. Get Changed Files
+- Tracks file changes in Python and Java code
+- Identifies Docker-related changes
+- Helps optimize scanning by focusing on changed components
+
+### 2. Bandit SAST Scan
+- Python-specific security scanner
+- Detects common security issues
+- Generates detailed JSON reports
+
+### 3. OWASP Dependency Check
+- Scans Java dependencies using Maven
+- Analyzes Python requirements with pip-audit
+- Identifies known vulnerabilities (CVEs)
+
+### 4. Trivy Filesystem Scan
+- Multi-scanner approach:
+  - Vulnerability scanning
+  - Secret detection
+  - Misconfiguration checks
+- Language-aware scanning for Python and Java
+
+### 5. Docker Build & Security
+- Multi-stage Docker builds
+- Secure build practices
+- Container registry integration
+- SBOM generation for Java builds
+
+### 6. Trivy Container Scan
+- Container vulnerability scanning
+- Configuration assessment
+- Customizable severity thresholds
+- Detailed reporting
+
+### 7. ZAP DAST Scan
+- Dynamic application security testing
+- Automated vulnerability discovery
+- Custom alert filtering
+- Multiple report formats (JSON, XML, HTML)
+
+## Artifacts and Reports
+
+Each job generates detailed reports and artifacts:
+
+1. **Bandit Results**
+   - `bandit-report.txt`: Human-readable summary
+   - `bandit-results.json`: Detailed findings
+
+2. **Dependency Check Results**
+   - `dependency-check-report.html`: Interactive report
+   - `dependency-check-report.json`: Machine-readable data
+   - `pip-audit-results.json`: Python dependency scan
+   - `pip-audit-report.txt`: Formatted Python findings
+
+3. **Trivy Scan Results**
+   - Filesystem scan reports
+   - Container vulnerability reports
+   - Configuration assessment findings
+
+4. **ZAP Scan Results**
+   - `zap-report.json`: Complete findings
+   - `zap-report.xml`: XML format
+   - `zap-report.html`: Interactive report
+   - `zap-summary.txt`: Quick overview
+
+## Environment Variables
+
+The workflow uses these key environment variables:
 ```yaml
-outputs:
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
   python_changes: Files with .py extension
   java_changes: Files with .java extension
   dockerfile_changed: Changes in Dockerfile or requirements.txt
