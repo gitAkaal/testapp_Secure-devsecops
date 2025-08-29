@@ -145,10 +145,87 @@ jobs:
             java-scan.json
           retention-days: 90
 
-  docker-build-push:
-    name: Build and Push Docker Image
+  java-docker-build:
+    name: Build Java Docker Image
     needs: [get-changed-files, trivy-fs-scan]
-    if: needs.get-changed-files.outputs.python_changes != '' || needs.get-changed-files.outputs.java_changes != '' || needs.get-changed-files.outputs.dockerfile_changed == 'true'
+    if: needs.get-changed-files.outputs.java_changes != '' || contains(needs.get-changed-files.outputs.all_changes, 'java_wordstop/Dockerfile')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          path: java_wordstop
+          format: spdx-json
+          output-file: java-sbom.json
+
+      - name: Extract metadata for Java Docker image
+        id: meta-java
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/java-wordstop
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=ref,event=tag
+            type=ref,event=pr
+
+      - name: Build and push Java image
+        uses: docker/build-push-action@v5
+        with:
+          context: java_wordstop
+          file: java_wordstop/Dockerfile
+          push: true
+          tags: ${{ steps.meta-java.outputs.tags }}
+          labels: ${{ steps.meta-java.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Run Trivy vulnerability scanner on Java image
+        run: |
+          echo "=== Running Trivy Java Container Scan ===" > java-container-scan.txt
+          IMAGE_TO_SCAN="${{ env.REGISTRY }}/${{ github.repository }}/java-wordstop:sha-${{ github.sha }}"
+          
+          echo "Scanning for vulnerabilities..." >> java-container-scan.txt
+          trivy image \
+            --format json \
+            --output java-vuln-scan.json \
+            --scanners vuln \
+            --severity ${{ github.event.inputs.severity_level || 'HIGH,CRITICAL' }} \
+            --exit-code 0 \
+            "$IMAGE_TO_SCAN"
+
+          echo "=== Java Container Scan Results ===" >> java-container-scan.txt
+          jq -r '.Results[] | select(.Vulnerabilities != null) | .Vulnerabilities[] | "[\(.Severity)] \(.VulnerabilityID): \(.Title)"' java-vuln-scan.json >> java-container-scan.txt
+
+      - name: Upload Java scan results
+        uses: actions/upload-artifact@v4
+        with:
+          name: java-security-results
+          path: |
+            java-container-scan.txt
+            java-vuln-scan.json
+            java-sbom.json
+          retention-days: 90
+
+  docker-build-push:
+    name: Build and Push Python Docker Image
+    needs: [get-changed-files, trivy-fs-scan]
+    if: needs.get-changed-files.outputs.python_changes != '' || needs.get-changed-files.outputs.dockerfile_changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
