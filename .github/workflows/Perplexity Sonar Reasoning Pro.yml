@@ -141,7 +141,7 @@ jobs:
         continue-on-error: true
 
       - name: 📦 OSV Scanner - Vulnerability Check
-        uses: google/osv-scanner-action@v1
+        uses: google/osv-scanner/github-action@v1
         with:
           scan-args: |-
             --recursive
