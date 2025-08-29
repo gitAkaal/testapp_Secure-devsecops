@@ -260,12 +260,45 @@ jobs:
       - name: 📥 Checkout code
         uses: actions/checkout@v4
 
-      - name: ⚡ ZAP Baseline Security Scan
-        uses: zaproxy/action-baseline@v0.10.0
+      - name: ⚡ ZAP Full Security Scan
+        uses: zaproxy/action-full-scan@v0.7.0
         with:
-          target: ${{ secrets.DAST_TARGET_URL || 'https://example.com' }}
+          target: ${{ secrets.DAST_TARGET_URL || 'http://localhost:8080' }}
           rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-a'
+          cmd_options: '-j -a -z "-config replacer.full_list(0).description=auth1 -config replacer.full_list(0).enabled=true"'
+          allow_issue_writing: true
+          fail_action: false
+          docker_name: 'owasp/zap2docker-stable'
+        continue-on-error: true
+
+      - name: 🚀 Runtime Java Application Test
+        if: needs.prepare.outputs.has_java == 'true'
+        run: |
+          cd java_wordstop
+          mvn clean package
+          java -jar target/*.jar &
+          sleep 10
+          curl -sSf http://localhost:8080/health || true
+        continue-on-error: true
+
+      - name: 🐍 Runtime Python Application Test
+        if: needs.prepare.outputs.has_python == 'true'
+        run: |
+          cd python_wordstop
+          pip install -r requirements.txt
+          python wordstop.py &
+          sleep 5
+          curl -sSf http://localhost:5000/health || true
+        continue-on-error: true
+
+      - name: 🔍 Runtime Security Analysis
+        run: |
+          # Check running processes
+          ps aux | grep -E "java|python" || true
+          # Check open ports
+          netstat -tulpn || true
+          # Check application logs
+          find . -name "*.log" -type f -exec tail -n 50 {} \; || true
         continue-on-error: true
 
       - name: 🎯 Nuclei Security Scanner

@@ -264,9 +264,9 @@ jobs:
             tenable/terrascan scan -t aws,azure,gcp,k8s || true
         continue-on-error: true
 
-  # Step 7: DAST (Including ZAP)
+  # Step 7: DAST and Runtime Security Testing
   dast-scan:
-    name: 🌐 Dynamic Application Security Testing
+    name: 🌐 Dynamic and Runtime Security Testing
     runs-on: ubuntu-latest
     needs: prepare
     # ONLY runs on manual trigger or schedule
@@ -277,12 +277,15 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: OWASP ZAP Baseline Scan
-        uses: zaproxy/action-baseline@v0.10.0
+      - name: OWASP ZAP Full Scan
+        uses: zaproxy/action-full-scan@v0.7.0
         with:
-          target: ${{ vars.DAST_TARGET_URL || 'http://example.com' }}
+          target: ${{ vars.DAST_TARGET_URL || 'http://localhost:8080' }}
           rules_file_name: '.zap/rules.tsv'
-          cmd_options: '-a'
+          cmd_options: '-j -a -z "-config replacer.full_list(0).description=auth1 -config replacer.full_list(0).enabled=true"'
+          allow_issue_writing: true
+          fail_action: false
+          docker_name: 'owasp/zap2docker-stable'
         continue-on-error: true
 
       - name: Nuclei Security Scan
@@ -295,8 +298,52 @@ jobs:
       - name: Nikto Web Scanner
         run: |
           docker run --rm sullo/nikto \
-            -h ${{ vars.DAST_TARGET_URL || 'http://example.com' }} \
+            -h ${{ vars.DAST_TARGET_URL || 'http://localhost:8080' }} \
             -output /tmp/nikto.txt || true
+        continue-on-error: true
+
+      # Runtime Security Testing for Java Application
+      - name: Build and Run Java Application
+        run: |
+          cd java_wordstop
+          mvn clean package
+          java -jar target/*.jar &
+          sleep 10  # Wait for application to start
+        continue-on-error: true
+
+      - name: OWASP ZAP Java App Scan
+        uses: zaproxy/action-full-scan@v0.7.0
+        with:
+          target: 'http://localhost:8080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-j -a'
+          docker_name: 'owasp/zap2docker-stable'
+        continue-on-error: true
+
+      # Runtime Security Testing for Python Application
+      - name: Build and Run Python Application
+        run: |
+          cd python_wordstop
+          pip install -r requirements.txt
+          python wordstop.py &
+          sleep 5  # Wait for application to start
+        continue-on-error: true
+
+      - name: OWASP ZAP Python App Scan
+        uses: zaproxy/action-full-scan@v0.7.0
+        with:
+          target: 'http://localhost:5000'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-j -a'
+          docker_name: 'owasp/zap2docker-stable'
+        continue-on-error: true
+
+      - name: Runtime Security Monitoring
+        run: |
+          # Monitor for potential security issues
+          ps aux | grep -E "java|python" || true
+          netstat -tulpn || true
+          # Add additional runtime security checks as needed
         continue-on-error: true
 
   # Step 8: License Compliance
