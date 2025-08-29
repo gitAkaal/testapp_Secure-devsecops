@@ -86,8 +86,7 @@ jobs:
     needs: get-changed-files
     if: |
       github.event_name != 'workflow_dispatch' ||
-      github.event.inputs.scan_type == 'all' ||
-      github.event.inputs.scan_type == 'sast'
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.scan_type == 'all' || github.event.inputs.scan_type == 'sast'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
@@ -149,7 +148,7 @@ jobs:
   docker-build-push:
     name: Build and Push Docker Image
     needs: [get-changed-files, trivy-fs-scan]
-    if: needs.get-changed-files.outputs.python_changes != '' || needs.get-changed-files.outputs.dockerfile_changed == 'true'
+    if: needs.get-changed-files.outputs.python_changes != '' || needs.get-changed-files.outputs.java_changes != '' || needs.get-changed-files.outputs.dockerfile_changed == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -252,8 +251,7 @@ jobs:
     needs: docker-build-push
     if: |
       github.event_name != 'workflow_dispatch' ||
-      github.event.inputs.scan_type == 'all' ||
-      github.event.inputs.scan_type == 'dast'
+      (github.event_name == 'workflow_dispatch' && (github.event.inputs.scan_type == 'all' || github.event.inputs.scan_type == 'dast'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
