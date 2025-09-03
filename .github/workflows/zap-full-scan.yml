@@ -1,0 +1,74 @@
+name: OWASP ZAP Full Scan
+
+on:
+  schedule:
+    - cron: '0 0 * * 0'  # Run weekly at midnight on Sunday
+  workflow_dispatch:      # Allow manual trigger
+
+jobs:
+  zap_scan:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - uses: actions/checkout@v3
+      
+      # Build and start Java application
+      - name: Set up Java
+        uses: actions/setup-java@v3
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          
+      - name: Build Java Application
+        run: |
+          cd java_wordstop
+          chmod +x mvnw
+          ./mvnw clean package
+          java -jar target/*.jar &
+          sleep 30  # Wait for Java app to start
+          
+      # Build and start Python application
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+          
+      - name: Install Python dependencies and start app
+        run: |
+          cd python_wordstop
+          pip install -r requirements.txt
+          python wordstop.py &
+          sleep 15  # Wait for Python app to start
+      
+      # Run ZAP scan against Java application
+      - name: ZAP Full Scan - Java Application
+        uses: zaproxy/action-full-scan@v0.4.0
+        with:
+          target: 'http://localhost:8080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+          
+      # Run ZAP scan against Python application
+      - name: ZAP Full Scan - Python Application
+        uses: zaproxy/action-full-scan@v0.4.0
+        with:
+          target: 'http://localhost:5000'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-a'
+        
+      # If you want to fail the build on certain alerts
+      - name: Check ZAP Results
+        run: |
+          if grep -i "high" zap-full-scan.txt; then
+            echo "High severity vulnerabilities found"
+            exit 1
+          fi
+          
+      # Upload ZAP Report as artifact
+      - name: Upload ZAP Report
+        uses: actions/upload-artifact@v3
+        with:
+          name: ZAP Full Scan Report
+          path: |
+            zap-full-scan.txt
+            zap-full-scan.md
