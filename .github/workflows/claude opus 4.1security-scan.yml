@@ -21,7 +21,7 @@ on:
   pull_request:
     branches: [ main, develop ]
   schedule:
-    - cron: '0 2 * * *'
+    - cron: '0 * * 1 *'
 
 env:
   # Force full scan for manual triggers
