@@ -1,12 +1,12 @@
-name: claude opus 4.1 Security Scan Pipeline
+name: "claude-opus-4.1-security-scan"
 
 on:
   workflow_dispatch:
     inputs:
       scan_type:
-        description: 'Type of scan to run'
+        description: "Type of scan to run"
         required: true
-        default: 'all'
+        default: "all"
         type: choice
         options:
           - all
