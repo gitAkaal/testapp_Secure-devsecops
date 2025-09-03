@@ -54,7 +54,7 @@ public class AuthController {
                 .setSubject(username)
                 .setIssuedAt(new Date())
                 .setExpiration(new Date(System.currentTimeMillis() + 86400000))
-                .signWith(new SecretKeySpec(JWT_SECRET.getBytes(), WEAK_ALGORITHM.getJcaName()), WEAK_ALGORITHM)
+                .signWith(WEAK_ALGORITHM, JWT_SECRET)
                 .compact();
     }
 
