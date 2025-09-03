@@ -1,0 +1,473 @@
+name: "claude-opus-4.1-security-scan"
+
+on:
+  workflow_dispatch:
+    inputs:
+      scan_type:
+        description: "Type of scan to run"
+        required: true
+        default: "all"
+        type: choice
+        options:
+          - all
+          - quick
+          - sa      
+      - name: Set up Java
+        uses: actions/setup-java@v4.0.0
+        with:
+          java-version: '11'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Build Java Application
+        working-directory: java_wordstop
+        run: |
+          mvn clean package
+          echo "Starting Java application..."
+          java -jar target/java-wordstop-1.0-SNAPSHOT.jar &
+          echo "Waiting for application to start..."
+          sleep 30
+          echo "Testing if application is up..."
+          curl -v http://localhost:8080/api/echo?input=test || true
+
+      - name: OWASP ZAP Full Scan - Java App
+        uses: zaproxy/action-full-scan@v0.9.0
+        with:
+          target: 'http://localhost:8080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-j -a -z "-config scanner.threadPerHost=2"'
+          docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
+          allow_issue_writing: true
+          fail_action: false
+        continue-on-error: true    - dependency
+          - container
+          - infrastructure
+          - dast
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  schedule:
+    - cron: '0 * * 1 *'
+
+env:
+  # Force full scan for manual triggers
+  FORCE_FULL_SCAN: ${{ github.event_name == 'workflow_dispatch' }}
+
+jobs:
+  # Step 1: Preparation
+  prepare:
+    name: 📋 Prepare and Analyze Changes
+    runs-on: ubuntu-latest
+    outputs:
+      run_mode: ${{ steps.mode.outputs.run_mode }}
+      skip_scans: ${{ steps.mode.outputs.skip_scans }}
+      has_python: ${{ steps.detect.outputs.has_python }}
+      has_node: ${{ steps.detect.outputs.has_node }}
+      has_docker: ${{ steps.detect.outputs.has_docker }}
+      has_terraform: ${{ steps.detect.outputs.has_terraform }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine run mode
+        id: mode
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            echo "run_mode=FULL_COMPREHENSIVE_SCAN" >> $GITHUB_OUTPUT
+            echo "skip_scans=false" >> $GITHUB_OUTPUT
+            echo "🚀 FULL SCAN MODE - All security checks will be executed!"
+          elif [[ "${{ github.event_name }}" == "schedule" ]]; then
+            echo "run_mode=SCHEDULED_FULL_SCAN" >> $GITHUB_OUTPUT
+            echo "skip_scans=false" >> $GITHUB_OUTPUT
+            echo "📅 Scheduled full scan - All checks enabled"
+          else
+            echo "run_mode=LIGHTWEIGHT_COMMIT_SCAN" >> $GITHUB_OUTPUT
+            echo "skip_scans=true" >> $GITHUB_OUTPUT
+            echo "⚡ Lightweight mode - Only essential scans"
+          fi
+
+      - name: Detect technologies
+        id: detect
+        run: |
+          echo "has_python=$([[ -f requirements.txt || -f setup.py || -f Pipfile ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_node=$([[ -f package.json || -f yarn.lock ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_docker=$([[ -f Dockerfile || -f docker-compose.yml ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_terraform=$([[ -d terraform || -f *.tf ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "has_java=$([[ -f pom.xml || -f build.gradle ]] && echo true || echo false)" >> $GITHUB_OUTPUT
+
+  # Step 2: Essential Security (Always runs)
+  essential-security:
+    name: 🔒 Essential Security Scans
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Semgrep SAST
+        uses: returntocorp/semgrep-action@v1
+        with:
+          config: >-
+            p/security-audit
+            p/owasp-top-ten
+        continue-on-error: true
+
+      - name: Gitleaks Secret Detection
+        uses: gitleaks/gitleaks-action@v2.3.3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: TruffleHog Secret Scan
+        uses: trufflesecurity/trufflehog@v3.63.2
+        with:
+          path: ./
+          base: main
+          head: HEAD
+        continue-on-error: true
+
+  # Step 3: Advanced SAST (Conditional)
+  advanced-sast:
+    name: 🛡️ Advanced SAST Analysis
+    runs-on: ubuntu-latest
+    needs: prepare
+    # CRITICAL: This ensures it runs on manual trigger
+    if: |
+      always() && 
+      (github.event_name == 'workflow_dispatch' || 
+       github.event_name == 'schedule')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3.22.11
+        with:
+          languages: 'javascript,python,java,go'
+        continue-on-error: true
+
+      - name: Autobuild
+        uses: github/codeql-action/autobuild@v3.22.11
+        continue-on-error: true
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v3.22.11
+        continue-on-error: true
+
+      - name: Bandit Python Security
+        if: needs.prepare.outputs.has_python == 'true'
+        run: |
+          pip install bandit
+          bandit -r . -f json -o bandit.json || true
+        continue-on-error: true
+
+  # Step 4: Dependency Scanning
+  dependency-scan:
+    name: 📦 Dependency Vulnerability Analysis
+    runs-on: ubuntu-latest
+    needs: prepare
+    # Run on manual trigger OR if dependencies changed
+    if: |
+      always() && 
+      (github.event_name == 'workflow_dispatch' || 
+       github.event_name == 'schedule')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: OSV Scanner
+        uses: google/osv-scanner-action@v2.2.2
+        with:
+          scan-args: |-
+            --recursive
+            --skip-git
+            ./
+        continue-on-error: true
+
+      - name: OWASP Dependency Check
+        uses: dependency-check/Dependency-Check_Action@main
+        with:
+          project: 'SecurityScan'
+          path: '.'
+          format: 'ALL'
+        continue-on-error: true
+
+      - name: NPM Audit
+        if: needs.prepare.outputs.has_node == 'true'
+        run: npm audit --audit-level=moderate || true
+        continue-on-error: true
+
+      - name: Safety Python Check
+        if: needs.prepare.outputs.has_python == 'true'
+        run: |
+          pip install safety
+          safety check || true
+        continue-on-error: true
+
+  # Step 5: Container Security
+  container-scan:
+    name: 🐳 Container Security Analysis
+    runs-on: ubuntu-latest
+    needs: prepare
+    # Run on manual trigger OR if Docker files exist
+    if: |
+      always() && 
+      needs.prepare.outputs.has_docker == 'true' &&
+      (github.event_name == 'workflow_dispatch' || 
+       github.event_name == 'schedule')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build Docker Image
+        id: build
+        run: |
+          if [ -f Dockerfile ]; then
+            docker build -t scanimage:${{ github.sha }} . || echo "image=failed" >> $GITHUB_OUTPUT
+            echo "image=scanimage:${{ github.sha }}" >> $GITHUB_OUTPUT
+          fi
+        continue-on-error: true
+
+      - name: Trivy Container Scan
+        if: steps.build.outputs.image != 'failed'
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build.outputs.image }}
+          format: 'table'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+        continue-on-error: true
+
+      - name: Grype Container Scan
+        if: steps.build.outputs.image != 'failed'
+        uses: anchore/scan-action@v3
+        with:
+          image: ${{ steps.build.outputs.image }}
+          fail-build: false
+        continue-on-error: true
+
+      - name: Hadolint Dockerfile Linting
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+          no-fail: true
+        continue-on-error: true
+
+  # Step 6: Infrastructure Security
+  infrastructure-scan:
+    name: 🏗️ Infrastructure Security Scan
+    runs-on: ubuntu-latest
+    needs: prepare
+    # Always run for IaC files
+    if: |
+      always() && 
+      (needs.prepare.outputs.has_terraform == 'true' || 
+       github.event_name == 'workflow_dispatch')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Checkov IaC Scan
+        uses: bridgecrewio/checkov-action@master
+        with:
+          directory: .
+          framework: all
+          soft_fail: true
+        continue-on-error: true
+
+      - name: KICS Scan
+        uses: checkmarx/kics-github-action@v1.7.0
+        with:
+          path: .
+          fail_on: high
+        continue-on-error: true
+
+      - name: Terrascan
+        if: needs.prepare.outputs.has_terraform == 'true'
+        run: |
+          docker run --rm -v "$(pwd):/src" \
+            tenable/terrascan scan -t aws,azure,gcp,k8s || true
+        continue-on-error: true
+
+  # Step 7: DAST and Runtime Security Testing
+  dast-scan:
+    name: 🌐 Dynamic and Runtime Security Testing
+    runs-on: ubuntu-latest
+    needs: prepare
+    # ONLY runs on manual trigger or schedule
+    if: |
+      github.event_name == 'workflow_dispatch' || 
+      github.event_name == 'schedule'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Docker
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: OWASP ZAP Full Scan
+        uses: zaproxy/action-full-scan@v0.9.0
+        with:
+          target: 'http://localhost:8080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-j -a'
+          docker_name: 'ghcr.io/zaproxy/zaproxy:stable'
+          allow_issue_writing: true
+          fail_action: false
+        continue-on-error: true
+
+      - name: Nuclei Security Scan
+        uses: projectdiscovery/nuclei-action@main
+        with:
+          target: ${{ vars.DAST_TARGET_URL || 'http://example.com' }}
+          flags: '-severity critical,high'
+        continue-on-error: true
+
+      - name: Nikto Web Scanner
+        run: |
+          docker run --rm sullo/nikto \
+            -h ${{ vars.DAST_TARGET_URL || 'http://localhost:8080' }} \
+            -output /tmp/nikto.txt || true
+        continue-on-error: true
+
+      # Runtime Security Testing for Java Application
+      - name: Build and Run Java Application
+        run: |
+          cd java_wordstop
+          mvn clean package
+          java -jar target/*.jar &
+          sleep 10  # Wait for application to start
+        continue-on-error: true
+
+      - name: OWASP ZAP Java App Scan
+        uses: zaproxy/action-full-scan@v0.7.0
+        with:
+          target: 'http://localhost:8080'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-j -a'
+          docker_name: 'owasp/zap2docker-stable'
+        continue-on-error: true
+
+      # Runtime Security Testing for Python Application
+      - name: Build and Run Python Application
+        run: |
+          cd python_wordstop
+          pip install -r requirements.txt
+          python wordstop.py &
+          sleep 5  # Wait for application to start
+        continue-on-error: true
+
+      - name: OWASP ZAP Python App Scan
+        uses: zaproxy/action-full-scan@v0.7.0
+        with:
+          target: 'http://localhost:5000'
+          rules_file_name: '.zap/rules.tsv'
+          cmd_options: '-j -a'
+          docker_name: 'owasp/zap2docker-stable'
+        continue-on-error: true
+
+      - name: Runtime Security Monitoring
+        run: |
+          # Monitor for potential security issues
+          ps aux | grep -E "java|python" || true
+          netstat -tulpn || true
+          # Add additional runtime security checks as needed
+        continue-on-error: true
+
+  # Step 8: License Compliance
+  license-compliance:
+    name: 📜 License Compliance Check
+    runs-on: ubuntu-latest
+    needs: prepare
+    # Run on manual trigger or schedule
+    if: |
+      github.event_name == 'workflow_dispatch' || 
+      github.event_name == 'schedule'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: License Finder
+        run: |
+          docker run --rm -v $(pwd):/scan licensefinder/license_finder || true
+        continue-on-error: true
+
+      - name: Licensed Check
+        uses: github/licensed-ci@v1
+        with:
+          command: status
+        continue-on-error: true
+
+  # Step 9: Policy Compliance
+  policy-compliance:
+    name: ✅ Compliance & Policy Check
+    runs-on: ubuntu-latest
+    needs: prepare
+    if: always()
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Git commit verification
+        run: |
+          echo "Checking commit signatures..."
+          git log --show-signature -1 || true
+        continue-on-error: true
+
+      - name: OPA Policy Check
+        run: |
+          if [ -d "policies" ]; then
+            docker run --rm -v $(pwd):/project \
+              openpolicyagent/opa test /project/policies || true
+          fi
+        continue-on-error: true
+
+  # Step 10: Generate Report
+  generate-report:
+    name: 📊 Generate Security Report
+    runs-on: ubuntu-latest
+    needs: 
+      - prepare
+      - essential-security
+      - advanced-sast
+      - dependency-scan
+      - container-scan
+      - infrastructure-scan
+      - dast-scan
+      - license-compliance
+      - policy-compliance
+    if: always()
+    steps:
+      - name: Generate Report
+        run: |
+          echo "# Security Scan Report" > report.md
+          echo "## Execution Summary" >> report.md
+          echo "- Run Mode: ${{ needs.prepare.outputs.run_mode }}" >> report.md
+          echo "- Date: $(date)" >> report.md
+          echo "" >> report.md
+          echo "## Scan Results" >> report.md
+          echo "| Scan | Status |" >> report.md
+          echo "|------|--------|" >> report.md
+          echo "| Essential Security | ${{ needs.essential-security.result }} |" >> report.md
+          echo "| Advanced SAST | ${{ needs.advanced-sast.result }} |" >> report.md
+          echo "| Dependency Scan | ${{ needs.dependency-scan.result }} |" >> report.md
+          echo "| Container Scan | ${{ needs.container-scan.result }} |" >> report.md
+          echo "| Infrastructure | ${{ needs.infrastructure-scan.result }} |" >> report.md
+          echo "| DAST (ZAP) | ${{ needs.dast-scan.result }} |" >> report.md
+          echo "| License Check | ${{ needs.license-compliance.result }} |" >> report.md
+          echo "| Policy Check | ${{ needs.policy-compliance.result }} |" >> report.md
+
+      - name: Upload Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: security-report
+          path: report.md

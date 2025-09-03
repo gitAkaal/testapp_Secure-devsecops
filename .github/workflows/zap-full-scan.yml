@@ -1,8 +1,6 @@
 name: OWASP ZAP Full Scan
 
 on:
-  schedule:
-    - cron: '0 0 * * 0'  # Run weekly at midnight on Sunday
   workflow_dispatch:      # Allow manual trigger
 
 jobs:
@@ -66,7 +64,7 @@ jobs:
           
       # Upload ZAP Report as artifact
       - name: Upload ZAP Report
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: ZAP Full Scan Report
           path: |
