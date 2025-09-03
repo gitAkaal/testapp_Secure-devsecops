@@ -22,12 +22,25 @@ jobs:
         with:
           maven-version: 3.8.2
 
-      - name: Build Java Application
+      - name: Build and Start Java Application
         run: |
           cd java_wordstop
           mvn clean package
-          java -jar target/*.jar &
-          sleep 30  # Wait for Java app to start
+          # Start with explicit Java opts and redirect output
+          java -Dserver.port=8080 -Dspring.profiles.active=test -jar target/*.jar > java_app.log 2>&1 &
+          # Wait for application to start
+          for i in {1..30}; do
+            if curl -s http://localhost:8080/health > /dev/null; then
+              echo "Java application started successfully"
+              break
+            fi
+            if [ $i -eq 30 ]; then
+              echo "Java application failed to start"
+              cat java_app.log
+              exit 1
+            fi
+            sleep 1
+          done
           
       # Build and start Python application
       - name: Set up Python
